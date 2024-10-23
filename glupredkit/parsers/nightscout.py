@@ -66,7 +66,9 @@ class Parser(BaseParser):
                 'find[created_at][$gte]': api_start_date,
                 'find[created_at][$lte]': api_end_date
             }
-            profile_url = f"{username}api/v1/profile?{urllib.parse.urlencode(profile_query_params)}"
+            base_url = username.rstrip('/')  # Remove trailing slash if present
+            profile_url = f"{base_url}/api/v1/profile?{urllib.parse.urlencode(profile_query_params)}"
+            # profile_url = f"{username}api/v1/profile?{urllib.parse.urlencode(profile_query_params)}"
             profiles_response = requests.get(profile_url, headers=api.request_headers())
             profiles = profiles_response.json()
             self.save_json_profiles(profiles, 'profiles', api_start_date, api_end_date)

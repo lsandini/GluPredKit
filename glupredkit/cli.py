@@ -712,8 +712,120 @@ def set_unit(use_mgdl):
     unit_config_manager.use_mgdl = use_mgdl
     click.echo(f'Set unit to {"mg/dL" if use_mgdl else "mmol/L"}.')
 
+DEFAULT_MODEL_DIR = './data/trained_models/'
 
-# Create a Click group and add the commands to it
+@click.command()
+@click.argument('model_file', type=str)
+@click.option('--ns-url', required=True, 
+              help='Nightscout URL (e.g., https://yoursite.herokuapp.com/)')
+@click.option('--api-key', required=True,
+              help='Nightscout API key')
+@click.option('--prediction-time', type=str,
+              help='Timestamp for prediction (format: YYYY-MM-DD HH:MM). Defaults to current time')
+@click.option('--history-hours', type=int, default=30,
+              help='Hours of historical data to fetch. Defaults to 30')
+def predict_at_time(model_file, ns_url, api_key, prediction_time=None, history_hours=30):
+    """Make predictions using a trained model at a specific time point."""
+    try:
+        if prediction_time:
+            pred_time = pd.to_datetime(prediction_time)
+        else:
+            pred_time = datetime.now()
+
+        start_time = pred_time - timedelta(hours=history_hours)
+
+        # Format dates as required
+        start_date = start_time.strftime('%d-%m-%Y')
+        end_date = pred_time.strftime('%d-%m-%Y')
+
+        # Remove trailing slash if present
+        ns_url = ns_url.rstrip('/')
+
+        click.echo(f"Fetching data from {start_date} to {end_date}...")
+
+        # Initialize parser directly
+        parser_module = importlib.import_module('glupredkit.parsers.nightscout')
+        chosen_parser = parser_module.Parser()
+
+        # Parse the data
+        historical_data = chosen_parser(
+            start_date=datetime.strptime(start_date, '%d-%m-%Y'),
+            end_date=datetime.strptime(end_date, '%d-%m-%Y'),
+            username=ns_url,
+            password=api_key
+        )
+
+        click.echo("Data retrieved successfully.")
+
+        # Determine the model file path
+        if not os.path.isabs(model_file):
+            model_file = os.path.join(DEFAULT_MODEL_DIR, model_file)
+
+        # Load the model from .pkl file
+        with open(model_file, 'rb') as f:
+            model_instance = dill.load(f)
+
+        # Use the ModelConfigurationManager if it needs specific config management
+        model_config_manager = ModelConfigurationManager(model_file.split('__')[1])
+
+        # Process the data
+        processed_data = model_instance.process_data(historical_data, model_config_manager, real_time=True)
+
+        # Print the shape of the processed DataFrame for debugging
+        print("Processed data shape for prediction:", processed_data.shape)
+
+        # Convert DataFrame to NumPy array
+        data_array = processed_data.to_numpy()
+
+        # Check if the number of rows is compatible with creating sequences of (24, 5)
+        num_rows = data_array.shape[0]
+        sequence_length = 24
+        features_per_sequence = 5
+
+        # Calculate the number of full sequences we can create
+        num_full_sequences = num_rows // sequence_length
+
+        if num_full_sequences > 0:
+            # Use only the data that fits into full sequences
+            usable_data_length = num_full_sequences * sequence_length
+            sequences = data_array[:usable_data_length].reshape(-1, sequence_length, features_per_sequence)
+        else:
+            print("Error: Not enough data to form sequences of length 24.")
+            return  # Or handle this case as needed
+
+        # Print the shape of processed data for debugging
+        print("Processed data shape for prediction:", processed_data.shape)
+
+        # Make predictions
+        predictions = model_instance.predict(processed_data)
+
+        # Generate timestamps for predictions (next hour with 5-minute intervals)
+        prediction_times = pd.date_range(
+            start=pred_time,
+            periods=12,  # 12 periods of 5 minutes = 60 minutes
+            freq='5min'
+        )
+
+        # Create a DataFrame to store predictions with their respective timestamps
+        predictions_df = pd.DataFrame({
+            'timestamp': prediction_times,
+            'predicted_glucose': predictions[0][:12]  # Assuming predictions returns a list of arrays
+        })
+
+        click.echo("\nPredictions for the next hour:")
+        for _, row in predictions_df.iterrows():
+            click.echo(f"{row['timestamp'].strftime('%Y-%m-%d %H:%M')}: {row['predicted_glucose']:.1f} mg/dL")
+
+        # Save predictions to a CSV file
+        output_file = f"predictions_{pred_time.strftime('%Y%m%d_%H%M')}.csv"
+        predictions_df.to_csv(output_file, index=False)
+        click.echo(f"\nPredictions saved to {output_file}")
+
+    except Exception as e:
+        click.echo(f"Error during prediction: {str(e)}")
+        raise
+
+# Create the CLI group OUTSIDE of any function
 cli = click.Group(commands={
     'setup_directories': setup_directories,
     'parse': parse,
@@ -724,6 +836,7 @@ cli = click.Group(commands={
     'generate_evaluation_pdf': generate_evaluation_pdf,
     'generate_comparison_pdf': generate_comparison_pdf,
     'set_unit': set_unit,
+    'predict_at_time': predict_at_time  # Add this line
 })
 
 if __name__ == "__main__":
