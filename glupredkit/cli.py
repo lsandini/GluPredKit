@@ -712,114 +712,164 @@ def set_unit(use_mgdl):
     unit_config_manager.use_mgdl = use_mgdl
     click.echo(f'Set unit to {"mg/dL" if use_mgdl else "mmol/L"}.')
 
-DEFAULT_MODEL_DIR = './data/trained_models/'
-
 @click.command()
-@click.argument('model_file', type=str)
-@click.option('--ns-url', required=True, 
-              help='Nightscout URL (e.g., https://yoursite.herokuapp.com/)')
-@click.option('--api-key', required=True,
+@click.option('--parser', type=click.Choice(['nightscout']), default='nightscout',
+              help='Data source parser (currently only nightscout supported)')
+@click.option('--username', type=str, required=True,
+              help='Nightscout URL (e.g., https://yoursite.herokuapp.com)')
+@click.option('--password', type=str, required=True,
               help='Nightscout API key')
-@click.option('--prediction-time', type=str,
-              help='Timestamp for prediction (format: YYYY-MM-DD HH:MM). Defaults to current time')
-@click.option('--history-hours', type=int, default=30,
-              help='Hours of historical data to fetch. Defaults to 30')
-def predict_at_time(model_file, ns_url, api_key, prediction_time=None, history_hours=30):
-    """Make predictions using a trained model at a specific time point."""
+@click.option('--model', type=str, required=True,
+              help='Model file name in ./data/trained_models/ (e.g., lstm__my_config_5__60.pkl)')
+def predict(parser, username, password, model):
+    """Download recent data and prepare for glucose prediction."""
     try:
-        if prediction_time:
-            pred_time = pd.to_datetime(prediction_time)
-        else:
-            pred_time = datetime.now()
+        # Verify model file exists
+        model_path = os.path.join('./data/trained_models/', model)
+        if not os.path.exists(model_path):
+            click.echo(f"Error: Model file not found at {model_path}")
+            return
 
-        start_time = pred_time - timedelta(hours=history_hours)
+        # Extract config name from model filename
+        config_name = model.split('__')[1]
+        click.echo(f"Using configuration: {config_name}")
+        
+        # Load model configuration
+        model_config_manager = ModelConfigurationManager(config_name)
+        configured_features = model_config_manager.get_num_features()
+        click.echo(f"\nModel configured features: {configured_features}")
+        
+        # Calculate required points
+        window_size = model_config_manager.get_num_lagged_features()
+        prediction_horizon = model_config_manager.get_prediction_horizon()
+        n_what_if = prediction_horizon // 5
+        required_points = window_size + n_what_if
+        
+        # Get current time and format dates
+        now = datetime.now()
+        end_date = (now + timedelta(days=1)).strftime('%d-%m-%Y')
+        start_date = (now - timedelta(hours=4)).strftime('%d-%m-%Y')
+        
+        click.echo(f"\nRequired data points: {required_points}")
+        click.echo(f"Fetching data from {start_date} to {end_date}")
 
-        # Format dates as required
-        start_date = start_time.strftime('%d-%m-%Y')
-        end_date = pred_time.strftime('%d-%m-%Y')
-
-        # Remove trailing slash if present
-        ns_url = ns_url.rstrip('/')
-
-        click.echo(f"Fetching data from {start_date} to {end_date}...")
-
-        # Initialize parser directly
-        parser_module = importlib.import_module('glupredkit.parsers.nightscout')
+        # Initialize and use the Nightscout parser
+        parser_module = importlib.import_module(f'glupredkit.parsers.{parser}')
         chosen_parser = parser_module.Parser()
 
         # Parse the data
-        historical_data = chosen_parser(
+        parsed_data = chosen_parser(
             start_date=datetime.strptime(start_date, '%d-%m-%Y'),
             end_date=datetime.strptime(end_date, '%d-%m-%Y'),
-            username=ns_url,
-            password=api_key
+            username=username,
+            password=password
         )
+        
+        if parsed_data.empty:
+            click.echo("\nError: No data retrieved")
+            return
 
-        click.echo("Data retrieved successfully.")
+        # Debug initial data state
+        click.echo("\nInitial parsed data:")
+        click.echo(f"Columns: {parsed_data.columns.tolist()}")
+        click.echo(f"Shape: {parsed_data.shape}")
 
-        # Determine the model file path
-        if not os.path.isabs(model_file):
-            model_file = os.path.join(DEFAULT_MODEL_DIR, model_file)
-
-        # Load the model from .pkl file
-        with open(model_file, 'rb') as f:
+        # Calculate insulin as total of basal and bolus
+        click.echo("\nBefore insulin calculation:")
+        click.echo(f"Columns: {parsed_data.columns.tolist()}")
+        parsed_data['insulin'] = parsed_data['basal'] + parsed_data['bolus']
+        click.echo("\nAfter insulin calculation:")
+        click.echo(f"Columns: {parsed_data.columns.tolist()}")
+            
+        # Add required columns if not present
+        if 'id' not in parsed_data.columns:
+            parsed_data['id'] = 1
+        if 'is_test' not in parsed_data.columns:
+            parsed_data['is_test'] = False
+        if 'hour' not in parsed_data.columns:
+            parsed_data['hour'] = parsed_data.index.hour
+            
+        # Reorder columns to match training data format
+        parsed_data = parsed_data[['id', 'CGM', 'insulin', 'carbs', 'is_test', 'hour', 'basal', 'bolus']]
+        click.echo("\nAfter reordering columns:")
+        click.echo(f"Columns: {parsed_data.columns.tolist()}")
+            
+        latest_timestamp = parsed_data.index.max()
+        click.echo(f"\nLatest data timestamp: {latest_timestamp}")
+        click.echo(f"Full data shape: {parsed_data.shape[0]} rows x {parsed_data.shape[1]} columns")
+        
+        click.echo("\nFirst few rows of input data:")
+        click.echo(parsed_data.head())
+        click.echo("\nLast few rows of input data:")
+        click.echo(parsed_data.tail())
+        
+        # Load the trained model
+        click.echo(f"\nLoading model from {model_path}")
+        with open(model_path, 'rb') as f:
             model_instance = dill.load(f)
+        click.echo("Model loaded successfully")
 
-        # Use the ModelConfigurationManager if it needs specific config management
-        model_config_manager = ModelConfigurationManager(model_file.split('__')[1])
+        # Filter to only include features used by model before processing
+        data_for_processing = parsed_data[configured_features]
+        click.echo(f"\nFeatures selected for prediction: {configured_features}")
+        click.echo(f"Data columns after feature selection: {data_for_processing.columns.tolist()}")
+        click.echo(f"Data shape after feature selection: {data_for_processing.shape}")
+        click.echo("\nSample of data for processing:")
+        click.echo(data_for_processing.head())
 
-        # Process the data
-        processed_data = model_instance.process_data(historical_data, model_config_manager, real_time=True)
-
-        # Print the shape of the processed DataFrame for debugging
-        print("Processed data shape for prediction:", processed_data.shape)
-
-        # Convert DataFrame to NumPy array
-        data_array = processed_data.to_numpy()
-
-        # Check if the number of rows is compatible with creating sequences of (24, 5)
-        num_rows = data_array.shape[0]
-        sequence_length = 24
-        features_per_sequence = 5
-
-        # Calculate the number of full sequences we can create
-        num_full_sequences = num_rows // sequence_length
-
-        if num_full_sequences > 0:
-            # Use only the data that fits into full sequences
-            usable_data_length = num_full_sequences * sequence_length
-            sequences = data_array[:usable_data_length].reshape(-1, sequence_length, features_per_sequence)
-        else:
-            print("Error: Not enough data to form sequences of length 24.")
-            return  # Or handle this case as needed
-
-        # Print the shape of processed data for debugging
-        print("Processed data shape for prediction:", processed_data.shape)
-
+        # Add target columns for real-time prediction
+        target_horizon = prediction_horizon // 5
+        for i in range(target_horizon):
+            target_col = f'target_{(i+1)*5}'
+            data_for_processing[target_col] = None
+            
+        # Process the data for prediction
+        click.echo("\nProcessing data for prediction...")
+        processed_data = model_instance.process_data(data_for_processing, model_config_manager, real_time=True)
+        
+        if isinstance(processed_data, tuple):
+            processed_data = processed_data[0]
+            
+        if processed_data.empty:
+            click.echo("Error: No sequences could be created from the data")
+            return
+            
+        click.echo("\nAfter process_data:")
+        click.echo(f"Processed data shape: {processed_data.shape}")
+        click.echo(f"Processed data columns: {processed_data.columns.tolist()}")
+        
+        # Convert sequences to arrays for shape checking
+        sequences = [np.array(ast.literal_eval(seq_str)) for seq_str in processed_data['sequence']]
+        sequences = np.array(sequences)
+        click.echo(f"\nSequence shape before prediction: {sequences.shape}")
+        
         # Make predictions
+        click.echo("\nMaking predictions...")
         predictions = model_instance.predict(processed_data)
-
-        # Generate timestamps for predictions (next hour with 5-minute intervals)
+        
+        # Create timestamps for predictions
         prediction_times = pd.date_range(
-            start=pred_time,
-            periods=12,  # 12 periods of 5 minutes = 60 minutes
+            start=latest_timestamp + pd.Timedelta(minutes=5),
+            periods=12,
             freq='5min'
         )
-
-        # Create a DataFrame to store predictions with their respective timestamps
+        
+        # Format predictions
         predictions_df = pd.DataFrame({
             'timestamp': prediction_times,
-            'predicted_glucose': predictions[0][:12]  # Assuming predictions returns a list of arrays
+            'predicted_glucose': predictions[0]  # First (and only) sequence predictions
         })
-
+        
         click.echo("\nPredictions for the next hour:")
         for _, row in predictions_df.iterrows():
             click.echo(f"{row['timestamp'].strftime('%Y-%m-%d %H:%M')}: {row['predicted_glucose']:.1f} mg/dL")
-
-        # Save predictions to a CSV file
-        output_file = f"predictions_{pred_time.strftime('%Y%m%d_%H%M')}.csv"
+            
+        # Save predictions to CSV
+        output_file = f"predictions_{latest_timestamp.strftime('%Y%m%d_%H%M')}.csv"
         predictions_df.to_csv(output_file, index=False)
         click.echo(f"\nPredictions saved to {output_file}")
+        
+        return predictions_df
 
     except Exception as e:
         click.echo(f"Error during prediction: {str(e)}")
@@ -836,7 +886,7 @@ cli = click.Group(commands={
     'generate_evaluation_pdf': generate_evaluation_pdf,
     'generate_comparison_pdf': generate_comparison_pdf,
     'set_unit': set_unit,
-    'predict_at_time': predict_at_time  # Add this line
+    'predict': predict  # Add this line
 })
 
 if __name__ == "__main__":
