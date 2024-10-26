@@ -784,6 +784,9 @@ def predict_loop(parser, username, password, model, prediction_time):
         if parsed_data.empty:
             click.echo("\nError: No data retrieved")
             return
+        
+        # Fill NaN values in 'carbs' column with 0
+        parsed_data['carbs'].fillna(0, inplace=True)  # Add this line
 
         # Load the trained Loop model
         click.echo(f"\nLoading model from {model_path}")
