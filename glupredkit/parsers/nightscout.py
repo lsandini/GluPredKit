@@ -48,7 +48,7 @@ class Parser(BaseParser):
 
             # Create DataFrame for Bolus insulin - include both Bolus and Meal Bolus
             df_bolus = self.create_dataframe(treatments, 'created_at', 'insulin', 'bolus', 
-                                            event_type=['Bolus', 'Meal Bolus', 'Snack Bolus', 'Correction Bolus'])
+                                            event_type=['Bolus', 'Meal Bolus', 'Snack Bolus', 'Correction Bolus', 'SMB'])
             print("Bolus DataFrame:")
             print(df_bolus)
 
@@ -68,7 +68,6 @@ class Parser(BaseParser):
             }
             base_url = username.rstrip('/')  # Remove trailing slash if present
             profile_url = f"{base_url}/api/v1/profile?{urllib.parse.urlencode(profile_query_params)}"
-            # profile_url = f"{username}api/v1/profile?{urllib.parse.urlencode(profile_query_params)}"
             profiles_response = requests.get(profile_url, headers=api.request_headers())
             profiles = profiles_response.json()
             self.save_json_profiles(profiles, 'profiles', api_start_date, api_end_date)
@@ -80,7 +79,7 @@ class Parser(BaseParser):
             print(df_basal_profile)
 
             # Resampling all datatypes into the same time-grid
-            df = df_glucose.resample('5min').mean()
+            df = df_glucose.resample('5min').mean().fillna(0)  # Fill NaN after resampling glucose
             df = self.merge_and_process(df, df_carbs, 'carbs')
             df = self.merge_and_process(df, df_bolus, 'bolus')
 
@@ -89,7 +88,9 @@ class Parser(BaseParser):
 
             # Process basal rate
             df['basal'] = round(df['basal'] / 60 * 5, 5)  # From U/hr to U (5-minutes)
-            df['insulin'] = df['bolus'].fillna(0) + df['basal'].fillna(0)
+            df['basal'] = df['basal'].fillna(0)  # Ensure no NaN in basal
+            df['bolus'] = df['bolus'].fillna(0)  # Ensure no NaN in bolus
+            df['insulin'] = df['bolus'] + df['basal']  # Calculate total insulin
 
             # Convert timezone to local timezone
             current_timezone = datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo
@@ -105,10 +106,18 @@ class Parser(BaseParser):
             # Reorder columns to match the desired output exactly
             df = df.reset_index()
             df = df[['date', 'id', 'CGM', 'insulin', 'carbs', 'is_test', 'hour', 'basal', 'bolus']]
+            
+            # Fill any remaining NaN values with 0 before setting final index
+            for col in ['CGM', 'insulin', 'carbs', 'basal', 'bolus']:
+                df[col] = df[col].fillna(0)
+                
             df.set_index('date', inplace=True)
 
             print("Final DataFrame:")
             print(df)
+            
+            # Add verification of treatments
+            df = self.verify_treatments(treatments, df)
 
             return df
 
@@ -124,14 +133,23 @@ class Parser(BaseParser):
         """
         Merge profile basal rates with temporary basal overrides, handling both absolute and percentage temp basals.
         """
+        # Fill any NaN in profile basal rates with 0
+        df_profile_basal['basal'] = df_profile_basal['basal'].fillna(0)
+        
         # Start with profile basal rates
         df = df.merge(df_profile_basal, left_index=True, right_index=True, how='left')
+        df['basal'] = df['basal'].fillna(0)  # Fill any NaN after merge
         
         if not df_temp_basal.empty:
             # For each temp basal entry
             temp_basals = pd.concat([df_temp_basal, df_temp_duration], axis=1)
             # Rename duplicate columns to avoid confusion
             temp_basals.columns = ['basal', 'percent_x', 'duration', 'percent_y']
+            
+            # Fill NaN in temp basals
+            temp_basals['basal'] = temp_basals['basal'].fillna(0)
+            temp_basals['percent_x'] = temp_basals['percent_x'].fillna(100)  # Default to 100% if not specified
+            
             print("\nTemp basals after concat:")
             print(temp_basals)
             
@@ -148,18 +166,17 @@ class Parser(BaseParser):
                 affected_rows = df[mask]
                 print(f"Number of affected rows: {len(affected_rows)}")
                 
-                # Check if we have an absolute value or percent (use percent_x which comes from temp_basal)
-                basal_value = float(row['basal']) if pd.notnull(row['basal']) else None
-                percent_value = float(row['percent_x']) if pd.notnull(row['percent_x']) else None
+                # Check if we have an absolute value or percent
+                basal_value = float(row['basal']) if pd.notnull(row['basal']) else 0
+                percent_value = float(row['percent_x']) if pd.notnull(row['percent_x']) else 100
                 
                 print(f"Basal value: {basal_value}")
                 print(f"Percent value: {percent_value}")
                 
-                if pd.notnull(basal_value):  # Absolute temp basal
+                if basal_value > 0:  # Absolute temp basal
                     print(f"Applying absolute basal: {basal_value}")
                     df.loc[mask, 'basal'] = basal_value
-                elif pd.notnull(percent_value):  # Percentage temp basal
-                    # Get the profile basal rates for this period and multiply by percentage
+                elif percent_value != 100:  # Percentage temp basal
                     profile_rates = df.loc[mask, 'basal']
                     print(f"Profile rates before adjustment: {profile_rates.head()}")
                     new_rates = profile_rates * (percent_value / 100)
@@ -169,6 +186,8 @@ class Parser(BaseParser):
                 print("Sample of affected rows after update:")
                 print(df[mask].head())
         
+        # Fill any remaining NaN values
+        df['basal'] = df['basal'].fillna(0)
         return df
 
     def get_basal_rates_from_profile(self, profiles):
@@ -201,11 +220,11 @@ class Parser(BaseParser):
         # Convert to list of (seconds, rate) tuples, calculating seconds if needed
         basal_rates = []
         for entry in basal_schedule:
-            seconds = entry.get('timeAsSeconds')
+            seconds = entry.get('timeAsSeconds', None)
             if seconds is None:
-                # Calculate seconds from time string if timeAsSeconds is missing
                 seconds = time_to_seconds(entry['time'])
-            basal_rates.append((seconds, entry['value']))
+            rate = entry.get('value', 0)  # Default to 0 if no value provided
+            basal_rates.append((seconds, rate))
         
         return sorted(basal_rates)
 
@@ -234,12 +253,10 @@ class Parser(BaseParser):
         
         current_date = date_range[0]
         while current_date <= date_range[1]:
-            # Calculate seconds since midnight
             seconds = (current_date.hour * 3600 + 
                       current_date.minute * 60 + 
                       current_date.second)
             
-            # Get basal rate for this time and round to 5 decimal places
             rate = round(self.get_basal_rate_for_time(basal_rates, seconds), 5)
             
             dates.append(current_date)
@@ -248,6 +265,7 @@ class Parser(BaseParser):
             current_date += datetime.timedelta(minutes=5)
         
         df = pd.DataFrame({'date': dates, 'basal': rates})
+        df['basal'] = df['basal'].fillna(0)  # Fill any NaN basal rates with 0
         df['date'] = pd.to_datetime(df['date'], utc=True)
         df.set_index('date', inplace=True)
         return df
@@ -259,7 +277,7 @@ class Parser(BaseParser):
         """
         dates = []
         values = []
-        percents = []  # New list for percentage values
+        percents = []
         
         for entry in data:
             if event_type:
@@ -267,42 +285,39 @@ class Parser(BaseParser):
                     if any(et in entry.eventType for et in event_type):
                         dates.append(getattr(entry, date_column))
                         if isinstance(value_column, list):
-                            # For temp basal, try to get absolute first
                             value = getattr(entry, value_column[0], None)
-                            if value is None:
+                            if value is None or pd.isna(value):
                                 value = getattr(entry, value_column[1], 0)
                         else:
                             value = getattr(entry, value_column, 0)
-                        values.append(value)
-                        # Get percent if it exists
-                        if hasattr(entry, '_json') and 'percent' in entry._json:
-                            percents.append(entry._json['percent'])
-                        else:
-                            percents.append(None)
+                        values.append(value if not pd.isna(value) else 0)
+                        percents.append(getattr(entry, 'percent', 0))  # Use 0 instead of None
                 elif event_type in entry.eventType:
                     dates.append(getattr(entry, date_column))
                     if isinstance(value_column, list):
                         value = getattr(entry, value_column[0], None)
-                        if value is None:
+                        if value is None or pd.isna(value):
                             value = getattr(entry, value_column[1], 0)
                     else:
                         value = getattr(entry, value_column, 0)
-                    values.append(value)
-                    # Get percent if it exists
-                    if hasattr(entry, '_json') and 'percent' in entry._json:
-                        percents.append(entry._json['percent'])
-                    else:
-                        percents.append(None)
+                    values.append(value if not pd.isna(value) else 0)
+                    percents.append(getattr(entry, 'percent', 0))  # Use 0 instead of None
             else:
                 dates.append(getattr(entry, date_column))
-                values.append(getattr(entry, value_column, 0))
-                percents.append(None)
+                value = getattr(entry, value_column, 0)
+                values.append(value if not pd.isna(value) else 0)
+                percents.append(0)  # Use 0 instead of None
         
         df = pd.DataFrame({
             'date': dates,
             new_column_name: values,
-            'percent': percents  # Add percent column
+            'percent': percents
         })
+        
+        # Fill any remaining NaN values with 0
+        df[new_column_name] = df[new_column_name].fillna(0)
+        df['percent'] = df['percent'].fillna(0)
+        
         df['date'] = pd.to_datetime(df['date'], utc=True)
         df.set_index('date', inplace=True)
         df.sort_index(inplace=True)
@@ -310,16 +325,83 @@ class Parser(BaseParser):
 
     def merge_and_process(self, df, df_to_merge, column_name):
         """
-        Merge and process dataframes.
+        Merge and process dataframes with better handling of bolus data and detailed logging.
         """
         if not df_to_merge.empty:
-            df_to_merge = df_to_merge.resample('5min').sum()
+            print(f"\nBefore resampling {column_name} data:")
+            print(f"Original {column_name} data:")
+            print(df_to_merge)
+            
+            # Convert index to exact 5-minute marks for better alignment
+            df_to_merge.index = df_to_merge.index.round('5min')
+            print(f"\nAfter rounding to 5min intervals:")
+            print(df_to_merge)
+            
+            # Fill NaN values before resampling
+            df_to_merge[column_name] = df_to_merge[column_name].fillna(0)
+            
+            # For bolus data, use last() instead of sum() to preserve individual boluses
+            if column_name == 'bolus':
+                df_to_merge = df_to_merge.resample('5min').last().fillna(0)
+            else:
+                df_to_merge = df_to_merge.resample('5min').sum().fillna(0)
+                
+            print(f"\nAfter resampling:")
+            print(df_to_merge)
+            
+            # Merge with original dataframe
+            print("\nMerging with main dataframe...")
+            print(f"Main df times: {df.index.min()} to {df.index.max()}")
+            print(f"{column_name} df times: {df_to_merge.index.min()} to {df_to_merge.index.max()}")
+            
             df = pd.merge(df, df_to_merge, left_index=True, right_index=True, how='outer')
+            
+            # Fill all NaN values with 0 after merge
             df[column_name] = df[column_name].fillna(0)
+            
+            print(f"\nAfter merge and fillna:")
+            print(df[df[column_name] > 0])  # Show only rows where we have values
+            
         else:
+            print(f"\nNo {column_name} data to merge")
             df[column_name] = 0
+        
         return df
 
+    def verify_treatments(self, treatments, final_df):
+        """
+        Verify that all treatments are properly captured in the final dataframe.
+        """
+        print("\nVerifying treatments capture:")
+        
+        for treatment in treatments:
+            treatment_time = pd.to_datetime(treatment.created_at).tz_convert(final_df.index.tz)
+            rounded_time = treatment_time.round('5min')
+            
+            if hasattr(treatment, 'insulin') and treatment.insulin:
+                insulin_value = float(treatment.insulin) if not pd.isna(treatment.insulin) else 0
+                print(f"\nChecking insulin treatment:")
+                print(f"Treatment time: {treatment_time}")
+                print(f"Rounded time: {rounded_time}")
+                print(f"Treatment insulin: {insulin_value}")
+                if rounded_time in final_df.index:
+                    print(f"Found in df: {final_df.loc[rounded_time, 'bolus']}")
+                else:
+                    print("Time not found in final dataframe!")
+            
+            if hasattr(treatment, 'carbs') and treatment.carbs:
+                carbs_value = float(treatment.carbs) if not pd.isna(treatment.carbs) else 0
+                print(f"\nChecking carb treatment:")
+                print(f"Treatment time: {treatment_time}")
+                print(f"Rounded time: {rounded_time}")
+                print(f"Treatment carbs: {carbs_value}")
+                if rounded_time in final_df.index:
+                    print(f"Found in df: {final_df.loc[rounded_time, 'carbs']}")
+                else:
+                    print("Time not found in final dataframe!")
+
+        return final_df
+    
     def save_json(self, data, data_type, start_date, end_date):
         """
         Save raw data to JSON file.

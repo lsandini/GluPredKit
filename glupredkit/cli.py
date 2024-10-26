@@ -724,7 +724,7 @@ def set_unit(use_mgdl):
 @click.option('--password', type=str, required=True,
               help='Nightscout API key')
 @click.option('--model', type=str, required=True,
-              help='Model file name in ./data/trained_models/ (e.g., loop__settings__60.pkl)')
+              help='Model file name in ./data/trained_models/ (e.g., loop__my_config_3__60.pkl)')
 @click.option('--prediction-time', type=str, required=False,
               help='Timestamp for prediction (format: dd-mm-yyyy/HH:MM). If not specified, uses current time')
 def predict_loop(parser, username, password, model, prediction_time):
@@ -771,15 +771,9 @@ def predict_loop(parser, username, password, model, prediction_time):
         utc_start = utc_pred_time - required_history
         utc_end = utc_pred_time + timedelta(minutes=5)
 
-        click.echo("\nRequesting data from Nightscout (UTC times):")
-        click.echo(f"Start time: {utc_start}")
-        click.echo(f"End time:   {utc_end}")
-
-        # Initialize and use the Nightscout parser
+        # Parse the data
         parser_module = importlib.import_module(f'glupredkit.parsers.{parser}')
         chosen_parser = parser_module.Parser()
-
-        # Parse the data using UTC times
         parsed_data = chosen_parser(
             start_date=utc_start,
             end_date=utc_end,
@@ -791,28 +785,27 @@ def predict_loop(parser, username, password, model, prediction_time):
             click.echo("\nError: No data retrieved")
             return
 
-        # Convert timestamps to local time for display and processing
-        parsed_data.index = parsed_data.index.tz_convert(local_tz)
-
         # Load the trained Loop model
         click.echo(f"\nLoading model from {model_path}")
         with open(model_path, 'rb') as f:
             model_instance = dill.load(f)
         click.echo("Model loaded successfully")
 
-        # Calculate window size for historical data (DIA in 5-minute intervals)
+        # Calculate window size for historical data
         window_size = model_instance.DIA // 5  # Convert DIA minutes to number of 5-min intervals
         click.echo(f"\nUsing window size of {window_size} intervals ({model_instance.DIA} minutes)")
 
         # Calculate daily statistics
-        # Reset index to work with datetime index
-        daily_data = parsed_data.reset_index()
-        daily_data['date'] = daily_data['date'].dt.date
-        
-        # Group by date and calculate daily totals
+        daily_data = parsed_data.copy()
+        daily_data['date'] = daily_data.index.date
+
+        # Reset the index to make 'date' a regular column
+        daily_data.reset_index(drop=True, inplace=True)
+
+        # Now you can group by 'date' without ambiguity
         daily_stats = daily_data.groupby('date').agg({
             'bolus': 'sum',
-            'basal': lambda x: x.mean() * 24  # Convert hourly rate to daily total
+            'basal': lambda x: x.mean() * 12 * 24  # Convert 5-min rate to daily total
         })
 
         # Calculate averages
@@ -820,51 +813,75 @@ def predict_loop(parser, username, password, model, prediction_time):
         avg_daily_bolus = daily_stats['bolus'].mean()
         avg_daily_insulin = avg_daily_basal + avg_daily_bolus
         
-        click.echo(f"\nDaily insulin statistics:")
+        # Calculate hourly basal rate and other parameters
+        hourly_basal = avg_daily_basal / 24  # Convert daily basal to hourly rate
+        isf = 180  # Fixed ISF for testing
+        cr = 50    # Fixed CR for testing
+
+        click.echo(f"\nCalculated therapy parameters:")
         click.echo(f"Average Daily Total Insulin: {avg_daily_insulin:.2f} U")
         click.echo(f"Average Daily Basal: {avg_daily_basal:.2f} U")
         click.echo(f"Average Daily Bolus: {avg_daily_bolus:.2f} U")
-
-        # Calculate therapy parameters with minimum thresholds
-        min_daily_insulin = max(avg_daily_insulin, 10)  # Minimum 10U/day
-        isf = 180  # Fixed ISF for testing
-        cr = 50    # Fixed CR for testing
-        hourly_basal = avg_daily_basal / 24  # Convert daily basal to hourly rate
-
-        click.echo(f"\nCalculated therapy parameters:")
-        click.echo(f"Insulin Sensitivity Factor: {isf:.1f} mg/dL/U")
-        click.echo(f"Carb Ratio: {cr:.1f} g/U")
         click.echo(f"Hourly Basal Rate: {hourly_basal:.3f} U/hr")
+        click.echo(f"ISF: {isf:.1f} mg/dL/U")
+        click.echo(f"CR: {cr:.1f} g/U")
 
         # Get the most recent data
-        historical_window = parsed_data.tail(window_size)
+        historical_window = parsed_data.tail(window_size).copy()
         latest_time = historical_window.index[-1]
 
         # Create prediction row as DataFrame with timestamp index
-        prediction_row = pd.DataFrame(index=[latest_time])
-        prediction_row['CGM'] = historical_window['CGM'].iloc[-1]
-        prediction_row['basal'] = historical_window['basal'].iloc[-1]
-        prediction_row['bolus'] = historical_window['bolus'].iloc[-1]
-        prediction_row['carbs'] = historical_window['carbs'].iloc[-1]
+        prediction_data = {
+            'CGM': [historical_window['CGM'].iloc[-1]],
+            'basal': [historical_window['basal'].iloc[-1]],
+            'bolus': [historical_window['bolus'].iloc[-1]],
+            'carbs': [historical_window['carbs'].iloc[-1]]
+        }
 
         # Add historical CGM values
         for i in range(1, len(historical_window)):
-            prediction_row[f'CGM_minus_{i*5}'] = historical_window['CGM'].iloc[-(i+1)]
+            prediction_data[f'CGM_minus_{i*5}'] = [historical_window['CGM'].iloc[-(i+1)]]
 
-        # Add what-if projections
-        for i in range(1, 13):  # 1 hour of 5-minute intervals
-            prediction_row[f'basal_what_if_{i*5}'] = hourly_basal / 12
-            prediction_row[f'bolus_what_if_{i*5}'] = 0
-            prediction_row[f'carbs_what_if_{i*5}'] = 0
+        # Add historical bolus values
+        for i in range(1, len(historical_window)):
+            prediction_data[f'bolus_minus_{i*5}'] = [historical_window['bolus'].iloc[-(i+1)]]
+
+        # Add what-if projections for next hour
+        future_timestamps = pd.date_range(
+            start=latest_time + pd.Timedelta(minutes=5),
+            periods=12,
+            freq='5min'
+        )
+
+        # Add projections for basal, bolus, and carbs
+        for i, future_time in enumerate(future_timestamps, 1):
+            time_diff = i * 5
+            prediction_data[f'basal_what_if_{time_diff}'] = [hourly_basal / 12]  # Convert hourly to 5-min rate
+            prediction_data[f'bolus_what_if_{time_diff}'] = [0]
+            prediction_data[f'carbs_what_if_{time_diff}'] = [0]
+
+        # Create prediction DataFrame all at once
+        prediction_row = pd.DataFrame(prediction_data, index=[latest_time])
 
         click.echo("\nPrepared prediction data:")
-        click.echo(f"Number of historical CGM values: {len([col for col in prediction_row.columns if 'minus' in col])}")
+        click.echo(f"Latest CGM: {prediction_row['CGM'].iloc[0]}")
+        click.echo(f"Latest basal: {prediction_row['basal'].iloc[0]}")
+        click.echo(f"Latest bolus: {prediction_row['bolus'].iloc[0]}")
+        click.echo(f"Number of historical CGM values: {len([col for col in prediction_row.columns if 'CGM_minus_' in col])}")
+        click.echo(f"Number of historical bolus values: {len([col for col in prediction_row.columns if 'bolus_minus_' in col])}")
         click.echo(f"Number of future intervals: {len([col for col in prediction_row.columns if 'what_if' in col])}")
+
+        # Debug insulin data before prediction
+        bolus_history = [prediction_row[col].iloc[0] for col in prediction_row.columns if 'bolus' in col]
+        click.echo("\nBolus values in prediction window:")
+        for i, val in enumerate(bolus_history):
+            if val > 0:
+                click.echo(f"Bolus found: {val}U")
 
         # Get prediction output using Loop algorithm
         click.echo("\nGenerating predictions...")
         output_dict = model_instance.get_prediction_output(
-            df_row=prediction_row.iloc[0],  # Convert to Series
+            df_row=prediction_row.iloc[0],
             input_dict=model_instance.get_input_dict(
                 insulin_sensitivity=isf,
                 carb_ratio=cr,
