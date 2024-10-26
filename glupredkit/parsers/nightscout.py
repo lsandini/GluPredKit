@@ -193,8 +193,20 @@ class Parser(BaseParser):
         default_profile = store[default_profile_name]
         basal_schedule = default_profile.get('basal', [])
         
-        # Convert to list of (seconds, rate) tuples
-        basal_rates = [(entry['timeAsSeconds'], entry['value']) for entry in basal_schedule]
+        def time_to_seconds(time_str):
+            """Convert time string (HH:MM) to seconds since midnight."""
+            hours, minutes = map(int, time_str.split(':'))
+            return hours * 3600 + minutes * 60
+        
+        # Convert to list of (seconds, rate) tuples, calculating seconds if needed
+        basal_rates = []
+        for entry in basal_schedule:
+            seconds = entry.get('timeAsSeconds')
+            if seconds is None:
+                # Calculate seconds from time string if timeAsSeconds is missing
+                seconds = time_to_seconds(entry['time'])
+            basal_rates.append((seconds, entry['value']))
+        
         return sorted(basal_rates)
 
     def get_basal_rate_for_time(self, basal_rates, seconds_since_midnight):
