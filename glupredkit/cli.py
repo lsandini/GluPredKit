@@ -721,7 +721,9 @@ def set_unit(use_mgdl):
               help='Nightscout API key')
 @click.option('--model', type=str, required=True,
               help='Model file name in ./data/trained_models/ (e.g., lstm__my_config_5__60.pkl)')
-def predict(parser, username, password, model):
+@click.option('--prediction-time', type=str, required=False,
+              help='Timestamp for prediction (format: dd-mm-yyyy/HH:MM). If not specified, uses current time')
+def predict(parser, username, password, model, prediction_time):
     """Download recent data and prepare for glucose prediction."""
     try:
         # Verify model file exists
@@ -745,13 +747,24 @@ def predict(parser, username, password, model):
         n_what_if = prediction_horizon // 5
         required_points = window_size + n_what_if
         
-        # Get current time and format dates
-        now = datetime.now()
-        end_date = (now + timedelta(days=1)).strftime('%d-%m-%Y')
-        start_date = (now - timedelta(hours=4)).strftime('%d-%m-%Y')
+        # Get prediction time
+        if prediction_time:
+            try:
+                pred_time = datetime.strptime(prediction_time, "%d-%m-%Y/%H:%M")
+                click.echo(f"\nUsing specified prediction time: {pred_time}")
+            except ValueError:
+                click.echo("Error: prediction-time must be in format 'dd-mm-yyyy/HH:MM' (e.g., 24-10-2024/19:30)")
+                return
+        else:
+            pred_time = datetime.now()
+            click.echo(f"\nUsing current time for prediction: {pred_time}")
+
+        # Calculate start and end dates
+        start_date = pred_time - timedelta(hours=4)  # 4 hours before prediction time
+        end_date = pred_time + timedelta(minutes=5)  # Just after prediction time
         
         click.echo(f"\nRequired data points: {required_points}")
-        click.echo(f"Fetching data from {start_date} to {end_date}")
+        click.echo(f"Fetching data from {start_date.strftime('%Y-%m-%d %H:%M')} to {end_date.strftime('%Y-%m-%d %H:%M')}")
 
         # Initialize and use the Nightscout parser
         parser_module = importlib.import_module(f'glupredkit.parsers.{parser}')
@@ -759,8 +772,8 @@ def predict(parser, username, password, model):
 
         # Parse the data
         parsed_data = chosen_parser(
-            start_date=datetime.strptime(start_date, '%d-%m-%Y'),
-            end_date=datetime.strptime(end_date, '%d-%m-%Y'),
+            start_date=start_date,
+            end_date=end_date,
             username=username,
             password=password
         )
@@ -794,6 +807,7 @@ def predict(parser, username, password, model):
         click.echo("\nAfter reordering columns:")
         click.echo(f"Columns: {parsed_data.columns.tolist()}")
             
+        # Get the actual latest timestamp in the data
         latest_timestamp = parsed_data.index.max()
         click.echo(f"\nLatest data timestamp: {latest_timestamp}")
         click.echo(f"Full data shape: {parsed_data.shape[0]} rows x {parsed_data.shape[1]} columns")
@@ -847,9 +861,14 @@ def predict(parser, username, password, model):
         click.echo("\nMaking predictions...")
         predictions = model_instance.predict(processed_data)
         
-        # Create timestamps for predictions
+        # Create timestamps for predictions starting from prediction time
+        if prediction_time:
+            start_predictions = pred_time
+        else:
+            start_predictions = latest_timestamp
+            
         prediction_times = pd.date_range(
-            start=latest_timestamp + pd.Timedelta(minutes=5),
+            start=start_predictions + pd.Timedelta(minutes=5),
             periods=12,
             freq='5min'
         )
@@ -865,7 +884,7 @@ def predict(parser, username, password, model):
             click.echo(f"{row['timestamp'].strftime('%Y-%m-%d %H:%M')}: {row['predicted_glucose']:.1f} mg/dL")
             
         # Save predictions to CSV
-        output_file = f"predictions_{latest_timestamp.strftime('%Y%m%d_%H%M')}.csv"
+        output_file = f"predictions_{start_predictions.strftime('%Y%m%d_%H%M')}.csv"
         predictions_df.to_csv(output_file, index=False)
         click.echo(f"\nPredictions saved to {output_file}")
         
