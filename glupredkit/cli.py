@@ -713,6 +713,9 @@ def set_unit(use_mgdl):
     unit_config_manager.use_mgdl = use_mgdl
     click.echo(f'Set unit to {"mg/dL" if use_mgdl else "mmol/L"}.')
 
+
+# COMMAND FOR LOOP PREDICTION
+
 @click.command()
 @click.option('--parser', type=click.Choice(['nightscout']), default='nightscout',
               help='Data source parser (currently only nightscout supported)')
@@ -721,11 +724,11 @@ def set_unit(use_mgdl):
 @click.option('--password', type=str, required=True,
               help='Nightscout API key')
 @click.option('--model', type=str, required=True,
-              help='Model file name in ./data/trained_models/ (e.g., lstm__my_config_5__60.pkl)')
+              help='Model file name in ./data/trained_models/ (e.g., loop__settings__60.pkl)')
 @click.option('--prediction-time', type=str, required=False,
               help='Timestamp for prediction (format: dd-mm-yyyy/HH:MM). If not specified, uses current time')
-def predict(parser, username, password, model, prediction_time):
-    """Download recent data and prepare for glucose prediction."""
+def predict_loop(parser, username, password, model, prediction_time):
+    """Download historical data and prepare for glucose prediction using Loop algorithm."""
     try:
         # Get local timezone
         local_tz = datetime.now().astimezone().tzinfo
@@ -745,45 +748,32 @@ def predict(parser, username, password, model, prediction_time):
         model_config_manager = ModelConfigurationManager(config_name)
         configured_features = model_config_manager.get_num_features()
         click.echo(f"\nModel configured features: {configured_features}")
-        
-        # Calculate required points
-        window_size = model_config_manager.get_num_lagged_features()
-        prediction_horizon = model_config_manager.get_prediction_horizon()
-        n_what_if = prediction_horizon // 5
-        required_points = window_size + n_what_if
-        
+
         # Get prediction time and convert to UTC
         if prediction_time:
             try:
-                # Parse local time and make it timezone-aware
                 local_pred_time = datetime.strptime(prediction_time, "%d-%m-%Y/%H:%M")
                 local_pred_time = local_pred_time.replace(tzinfo=local_tz)
-                
-                # Convert to UTC
                 utc_pred_time = local_pred_time.astimezone(timezone.utc)
-                
-                click.echo(f"\nPrediction time:")
-                click.echo(f"Local time: {local_pred_time}")
-                click.echo(f"UTC time:   {utc_pred_time}")
             except ValueError:
-                click.echo("Error: prediction-time must be in format 'dd-mm-yyyy/HH:MM' (e.g., 24-10-2024/19:30)")
+                click.echo("Error: prediction-time must be in format 'dd-mm-yyyy/HH:MM'")
                 return
         else:
-            # Use current time
             local_pred_time = datetime.now().astimezone(local_tz)
             utc_pred_time = local_pred_time.astimezone(timezone.utc)
-            click.echo(f"\nUsing current time for prediction:")
-            click.echo(f"Local time: {local_pred_time}")
-            click.echo(f"UTC time:   {utc_pred_time}")
+
+        click.echo(f"\nPrediction time:")
+        click.echo(f"Local time: {local_pred_time}")
+        click.echo(f"UTC time:   {utc_pred_time}")
 
         # Calculate UTC start and end times for data retrieval
-        utc_start = utc_pred_time - timedelta(hours=4)
+        required_history = timedelta(hours=24) + timedelta(minutes=360)  # 24 hours + DIA
+        utc_start = utc_pred_time - required_history
         utc_end = utc_pred_time + timedelta(minutes=5)
-        
+
         click.echo("\nRequesting data from Nightscout (UTC times):")
         click.echo(f"Start time: {utc_start}")
         click.echo(f"End time:   {utc_end}")
-        click.echo(f"Required data points: {required_points}")
 
         # Initialize and use the Nightscout parser
         parser_module = importlib.import_module(f'glupredkit.parsers.{parser}')
@@ -796,7 +786,7 @@ def predict(parser, username, password, model, prediction_time):
             username=username,
             password=password
         )
-        
+
         if parsed_data.empty:
             click.echo("\nError: No data retrieved")
             return
@@ -804,127 +794,120 @@ def predict(parser, username, password, model, prediction_time):
         # Convert timestamps to local time for display and processing
         parsed_data.index = parsed_data.index.tz_convert(local_tz)
 
-        click.echo("\nData retrieved from Nightscout:")
-        click.echo(f"Number of records: {len(parsed_data)}")
-        if len(parsed_data) > 0:
-            click.echo(f"First record time (local): {parsed_data.index.min().strftime('%Y-%m-%d %H:%M:%S %z')}")
-            click.echo(f"Last record time (local):  {parsed_data.index.max().strftime('%Y-%m-%d %H:%M:%S %z')}")
-            click.echo("\nSample of retrieved data (first 5 records):")
-            click.echo(parsed_data.head())
-            click.echo("\nSample of retrieved data (last 5 records):")
-            click.echo(parsed_data.tail())
-
-        # Debug initial data state
-        click.echo("\nInitial parsed data:")
-        click.echo(f"Columns: {parsed_data.columns.tolist()}")
-        click.echo(f"Shape: {parsed_data.shape}")
-
-        # Calculate insulin as total of basal and bolus
-        click.echo("\nBefore insulin calculation:")
-        click.echo(f"Columns: {parsed_data.columns.tolist()}")
-        parsed_data['insulin'] = parsed_data['basal'] + parsed_data['bolus']
-        click.echo("\nAfter insulin calculation:")
-        click.echo(f"Columns: {parsed_data.columns.tolist()}")
-            
-        # Add required columns if not present
-        if 'id' not in parsed_data.columns:
-            parsed_data['id'] = 1
-        if 'is_test' not in parsed_data.columns:
-            parsed_data['is_test'] = False
-        if 'hour' not in parsed_data.columns:
-            parsed_data['hour'] = parsed_data.index.hour
-            
-        # Reorder columns to match training data format
-        parsed_data = parsed_data[['id', 'CGM', 'insulin', 'carbs', 'is_test', 'hour', 'basal', 'bolus']]
-        click.echo("\nAfter reordering columns:")
-        click.echo(f"Columns: {parsed_data.columns.tolist()}")
-            
-        latest_timestamp = parsed_data.index.max()
-        click.echo(f"\nLatest data timestamp (local): {latest_timestamp}")
-        click.echo(f"Full data shape: {parsed_data.shape[0]} rows x {parsed_data.shape[1]} columns")
-        
-        click.echo("\nFirst few rows of input data:")
-        click.echo(parsed_data.head())
-        click.echo("\nLast few rows of input data:")
-        click.echo(parsed_data.tail())
-        
-        # Load the trained model
+        # Load the trained Loop model
         click.echo(f"\nLoading model from {model_path}")
         with open(model_path, 'rb') as f:
             model_instance = dill.load(f)
         click.echo("Model loaded successfully")
 
-        # Filter to only include features used by model before processing
-        data_for_processing = parsed_data[configured_features]
-        click.echo(f"\nFeatures selected for prediction: {configured_features}")
-        click.echo(f"Data columns after feature selection: {data_for_processing.columns.tolist()}")
-        click.echo(f"Data shape after feature selection: {data_for_processing.shape}")
-        click.echo("\nSample of data for processing:")
-        click.echo(data_for_processing.head())
+        # Calculate window size for historical data (DIA in 5-minute intervals)
+        window_size = model_instance.DIA // 5  # Convert DIA minutes to number of 5-min intervals
+        click.echo(f"\nUsing window size of {window_size} intervals ({model_instance.DIA} minutes)")
 
-        # Add target columns for real-time prediction
-        target_horizon = prediction_horizon // 5
-        for i in range(target_horizon):
-            target_col = f'target_{(i+1)*5}'
-            data_for_processing[target_col] = None
-            
-        # Process the data for prediction
-        click.echo("\nProcessing data for prediction...")
-        processed_data = model_instance.process_data(data_for_processing, model_config_manager, real_time=True)
+        # Calculate daily statistics
+        # Reset index to work with datetime index
+        daily_data = parsed_data.reset_index()
+        daily_data['date'] = daily_data['date'].dt.date
         
-        if isinstance(processed_data, tuple):
-            processed_data = processed_data[0]
-            
-        if processed_data.empty:
-            click.echo("Error: No sequences could be created from the data")
-            return
-            
-        click.echo("\nAfter process_data:")
-        click.echo(f"Processed data shape: {processed_data.shape}")
-        click.echo(f"Processed data columns: {processed_data.columns.tolist()}")
+        # Group by date and calculate daily totals
+        daily_stats = daily_data.groupby('date').agg({
+            'bolus': 'sum',
+            'basal': lambda x: x.mean() * 24  # Convert hourly rate to daily total
+        })
+
+        # Calculate averages
+        avg_daily_basal = daily_stats['basal'].mean()
+        avg_daily_bolus = daily_stats['bolus'].mean()
+        avg_daily_insulin = avg_daily_basal + avg_daily_bolus
         
-        # Convert sequences to arrays for shape checking
-        sequences = [np.array(ast.literal_eval(seq_str)) for seq_str in processed_data['sequence']]
-        sequences = np.array(sequences)
-        click.echo(f"\nSequence shape before prediction: {sequences.shape}")
-        
-        # Make predictions
-        click.echo("\nMaking predictions...")
-        predictions = model_instance.predict(processed_data)
-        
-        # Create timestamps for predictions starting from prediction time
-        if prediction_time:
-            start_predictions = local_pred_time
-        else:
-            start_predictions = latest_timestamp
-            
-        prediction_times = pd.date_range(
-            start=start_predictions + pd.Timedelta(minutes=5),
-            periods=12,
-            freq='5min',
-            tz=local_tz
+        click.echo(f"\nDaily insulin statistics:")
+        click.echo(f"Average Daily Total Insulin: {avg_daily_insulin:.2f} U")
+        click.echo(f"Average Daily Basal: {avg_daily_basal:.2f} U")
+        click.echo(f"Average Daily Bolus: {avg_daily_bolus:.2f} U")
+
+        # Calculate therapy parameters with minimum thresholds
+        min_daily_insulin = max(avg_daily_insulin, 10)  # Minimum 10U/day
+        isf = 180  # Fixed ISF for testing
+        cr = 50    # Fixed CR for testing
+        hourly_basal = avg_daily_basal / 24  # Convert daily basal to hourly rate
+
+        click.echo(f"\nCalculated therapy parameters:")
+        click.echo(f"Insulin Sensitivity Factor: {isf:.1f} mg/dL/U")
+        click.echo(f"Carb Ratio: {cr:.1f} g/U")
+        click.echo(f"Hourly Basal Rate: {hourly_basal:.3f} U/hr")
+
+        # Get the most recent data
+        historical_window = parsed_data.tail(window_size)
+        latest_time = historical_window.index[-1]
+
+        # Create prediction row as DataFrame with timestamp index
+        prediction_row = pd.DataFrame(index=[latest_time])
+        prediction_row['CGM'] = historical_window['CGM'].iloc[-1]
+        prediction_row['basal'] = historical_window['basal'].iloc[-1]
+        prediction_row['bolus'] = historical_window['bolus'].iloc[-1]
+        prediction_row['carbs'] = historical_window['carbs'].iloc[-1]
+
+        # Add historical CGM values
+        for i in range(1, len(historical_window)):
+            prediction_row[f'CGM_minus_{i*5}'] = historical_window['CGM'].iloc[-(i+1)]
+
+        # Add what-if projections
+        for i in range(1, 13):  # 1 hour of 5-minute intervals
+            prediction_row[f'basal_what_if_{i*5}'] = hourly_basal / 12
+            prediction_row[f'bolus_what_if_{i*5}'] = 0
+            prediction_row[f'carbs_what_if_{i*5}'] = 0
+
+        click.echo("\nPrepared prediction data:")
+        click.echo(f"Number of historical CGM values: {len([col for col in prediction_row.columns if 'minus' in col])}")
+        click.echo(f"Number of future intervals: {len([col for col in prediction_row.columns if 'what_if' in col])}")
+
+        # Get prediction output using Loop algorithm
+        click.echo("\nGenerating predictions...")
+        output_dict = model_instance.get_prediction_output(
+            df_row=prediction_row.iloc[0],  # Convert to Series
+            input_dict=model_instance.get_input_dict(
+                insulin_sensitivity=isf,
+                carb_ratio=cr,
+                basal=hourly_basal
+            ),
+            time_to_calculate=latest_time
         )
+
+        if not output_dict or "predicted_glucose_values" not in output_dict:
+            click.echo("Error: Could not generate predictions")
+            return
+
+        # Extract predictions (only take first hour)
+        predictions = output_dict["predicted_glucose_values"][:12]  # 1 hour of 5-minute predictions
         
-        # Format predictions
+        # Create timestamps for predictions
+        prediction_times = pd.date_range(
+            start=latest_time + pd.Timedelta(minutes=5),
+            periods=12,
+            freq='5min'
+        )
+
+        # Create predictions dataframe
         predictions_df = pd.DataFrame({
             'timestamp': prediction_times,
-            'predicted_glucose': predictions[0]  # First (and only) sequence predictions
+            'predicted_glucose': predictions
         })
-        
+
         click.echo("\nPredictions for the next hour:")
         for _, row in predictions_df.iterrows():
             click.echo(f"{row['timestamp'].strftime('%Y-%m-%d %H:%M')}: {row['predicted_glucose']:.1f} mg/dL")
-            
+
         # Save predictions to CSV
-        output_file = f"predictions_{start_predictions.strftime('%Y%m%d_%H%M')}.csv"
+        output_file = f"predictions_{local_pred_time.strftime('%Y%m%d_%H%M')}.csv"
         predictions_df.to_csv(output_file, index=False)
         click.echo(f"\nPredictions saved to {output_file}")
-        
+
         return predictions_df
 
     except Exception as e:
         click.echo(f"Error during prediction: {str(e)}")
         raise
+
 
 # Create the CLI group OUTSIDE of any function
 cli = click.Group(commands={
@@ -937,7 +920,7 @@ cli = click.Group(commands={
     'generate_evaluation_pdf': generate_evaluation_pdf,
     'generate_comparison_pdf': generate_comparison_pdf,
     'set_unit': set_unit,
-    'predict': predict  # Add this line
+    'predict_loop': predict_loop
 })
 
 if __name__ == "__main__":
