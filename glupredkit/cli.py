@@ -20,6 +20,7 @@ from glupredkit.helpers.unit_config_manager import unit_config_manager
 from glupredkit.helpers.model_config_manager import ModelConfigurationManager, generate_model_configuration
 import glupredkit.helpers.cli as helpers
 import glupredkit.helpers.generate_report as generate_report
+from datetime import timedelta, datetime, timezone
 
 
 # TODO: Fix so that all default values are defined upstream (=here in the CLI), and removed from downstream
@@ -726,6 +727,10 @@ def set_unit(use_mgdl):
 def predict(parser, username, password, model, prediction_time):
     """Download recent data and prepare for glucose prediction."""
     try:
+        # Get local timezone
+        local_tz = datetime.now().astimezone().tzinfo
+        click.echo(f"\nLocal timezone: {local_tz}")
+
         # Verify model file exists
         model_path = os.path.join('./data/trained_models/', model)
         if not os.path.exists(model_path):
@@ -747,33 +752,47 @@ def predict(parser, username, password, model, prediction_time):
         n_what_if = prediction_horizon // 5
         required_points = window_size + n_what_if
         
-        # Get prediction time
+        # Get prediction time and convert to UTC
         if prediction_time:
             try:
-                pred_time = datetime.strptime(prediction_time, "%d-%m-%Y/%H:%M")
-                click.echo(f"\nUsing specified prediction time: {pred_time}")
+                # Parse local time and make it timezone-aware
+                local_pred_time = datetime.strptime(prediction_time, "%d-%m-%Y/%H:%M")
+                local_pred_time = local_pred_time.replace(tzinfo=local_tz)
+                
+                # Convert to UTC
+                utc_pred_time = local_pred_time.astimezone(timezone.utc)
+                
+                click.echo(f"\nPrediction time:")
+                click.echo(f"Local time: {local_pred_time}")
+                click.echo(f"UTC time:   {utc_pred_time}")
             except ValueError:
                 click.echo("Error: prediction-time must be in format 'dd-mm-yyyy/HH:MM' (e.g., 24-10-2024/19:30)")
                 return
         else:
-            pred_time = datetime.now()
-            click.echo(f"\nUsing current time for prediction: {pred_time}")
+            # Use current time
+            local_pred_time = datetime.now().astimezone(local_tz)
+            utc_pred_time = local_pred_time.astimezone(timezone.utc)
+            click.echo(f"\nUsing current time for prediction:")
+            click.echo(f"Local time: {local_pred_time}")
+            click.echo(f"UTC time:   {utc_pred_time}")
 
-        # Calculate start and end dates
-        start_date = pred_time - timedelta(hours=4)  # 4 hours before prediction time
-        end_date = pred_time + timedelta(minutes=5)  # Just after prediction time
+        # Calculate UTC start and end times for data retrieval
+        utc_start = utc_pred_time - timedelta(hours=4)
+        utc_end = utc_pred_time + timedelta(minutes=5)
         
-        click.echo(f"\nRequired data points: {required_points}")
-        click.echo(f"Fetching data from {start_date.strftime('%Y-%m-%d %H:%M')} to {end_date.strftime('%Y-%m-%d %H:%M')}")
+        click.echo("\nRequesting data from Nightscout (UTC times):")
+        click.echo(f"Start time: {utc_start}")
+        click.echo(f"End time:   {utc_end}")
+        click.echo(f"Required data points: {required_points}")
 
         # Initialize and use the Nightscout parser
         parser_module = importlib.import_module(f'glupredkit.parsers.{parser}')
         chosen_parser = parser_module.Parser()
 
-        # Parse the data
+        # Parse the data using UTC times
         parsed_data = chosen_parser(
-            start_date=start_date,
-            end_date=end_date,
+            start_date=utc_start,
+            end_date=utc_end,
             username=username,
             password=password
         )
@@ -781,6 +800,19 @@ def predict(parser, username, password, model, prediction_time):
         if parsed_data.empty:
             click.echo("\nError: No data retrieved")
             return
+
+        # Convert timestamps to local time for display and processing
+        parsed_data.index = parsed_data.index.tz_convert(local_tz)
+
+        click.echo("\nData retrieved from Nightscout:")
+        click.echo(f"Number of records: {len(parsed_data)}")
+        if len(parsed_data) > 0:
+            click.echo(f"First record time (local): {parsed_data.index.min().strftime('%Y-%m-%d %H:%M:%S %z')}")
+            click.echo(f"Last record time (local):  {parsed_data.index.max().strftime('%Y-%m-%d %H:%M:%S %z')}")
+            click.echo("\nSample of retrieved data (first 5 records):")
+            click.echo(parsed_data.head())
+            click.echo("\nSample of retrieved data (last 5 records):")
+            click.echo(parsed_data.tail())
 
         # Debug initial data state
         click.echo("\nInitial parsed data:")
@@ -807,9 +839,8 @@ def predict(parser, username, password, model, prediction_time):
         click.echo("\nAfter reordering columns:")
         click.echo(f"Columns: {parsed_data.columns.tolist()}")
             
-        # Get the actual latest timestamp in the data
         latest_timestamp = parsed_data.index.max()
-        click.echo(f"\nLatest data timestamp: {latest_timestamp}")
+        click.echo(f"\nLatest data timestamp (local): {latest_timestamp}")
         click.echo(f"Full data shape: {parsed_data.shape[0]} rows x {parsed_data.shape[1]} columns")
         
         click.echo("\nFirst few rows of input data:")
@@ -863,14 +894,15 @@ def predict(parser, username, password, model, prediction_time):
         
         # Create timestamps for predictions starting from prediction time
         if prediction_time:
-            start_predictions = pred_time
+            start_predictions = local_pred_time
         else:
             start_predictions = latest_timestamp
             
         prediction_times = pd.date_range(
             start=start_predictions + pd.Timedelta(minutes=5),
             periods=12,
-            freq='5min'
+            freq='5min',
+            tz=local_tz
         )
         
         # Format predictions
