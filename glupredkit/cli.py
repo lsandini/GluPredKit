@@ -3,6 +3,7 @@ import click
 import dill
 import requests
 import warnings
+import pickle
 import os
 import ast
 import importlib
@@ -929,6 +930,199 @@ def predict_loop(parser, username, password, model, prediction_time):
         raise
 
 
+
+import click
+from datetime import datetime, timezone, timedelta
+import os
+import importlib
+import pandas as pd
+import pickle
+
+@click.command()
+@click.option('--parser', type=click.Choice(['nightscout']), default='nightscout',
+              help='Data source parser (currently only nightscout supported)')
+@click.option('--username', type=str, required=True,
+              help='Nightscout URL (e.g., https://yoursite.herokuapp.com)')
+@click.option('--password', type=str, required=True,
+              help='Nightscout API key')
+@click.option('--model', type=str, required=True,
+              help='Model file name in ./data/trained_models/ (e.g., loop__my_config_3__60.pkl)')
+@click.option('--prediction-time', type=str, required=False,
+              help='Timestamp for prediction (format: dd-mm-yyyy/HH:MM). If not specified, uses current time')
+def predict_loop2(parser, username, password, model, prediction_time):
+    """Generate glucose predictions using downloaded historical data."""
+    try:
+        # 1. Setup and time handling
+        local_tz = datetime.now().astimezone().tzinfo
+        
+        # Load model
+        model_path = os.path.join('./data/trained_models/', model)
+        if not os.path.exists(model_path):
+            click.echo(f"Error: Model file not found at {model_path}")
+            return
+
+        with open(model_path, 'rb') as f:
+            model_instance = pickle.load(f)
+
+        # Parse prediction time
+        if prediction_time:
+            try:
+                local_pred_time = datetime.strptime(prediction_time, "%d-%m-%Y/%H:%M")
+                local_pred_time = local_pred_time.replace(tzinfo=local_tz)
+            except ValueError:
+                click.echo("Error: prediction-time must be in format 'dd-mm-yyyy/HH:MM'")
+                return
+        else:
+            local_pred_time = datetime.now().astimezone(local_tz)
+
+        utc_pred_time = local_pred_time.astimezone(timezone.utc)
+        
+        # 2. Get required data window (24h + DIA)
+        required_history = timedelta(hours=24) + timedelta(minutes=model_instance.DIA)
+        utc_start = utc_pred_time - required_history
+        utc_end = utc_pred_time + timedelta(hours=1)  # Include next hour for future events
+
+        # 3. Get data using parser
+        parser_module = importlib.import_module(f'glupredkit.parsers.{parser}')
+        parser_instance = parser_module.Parser()
+        df = parser_instance(
+            start_date=utc_start,
+            end_date=utc_end,
+            username=username,
+            password=password
+        )
+
+        if df.empty:
+            click.echo("\nError: No data retrieved")
+            return
+
+        # 4. Calculate daily statistics from parser output
+        last_24h_end = utc_pred_time
+        last_24h_start = last_24h_end - timedelta(hours=24)
+        
+        # Use the known basal rate from profile (0.9-1.0 U/hr)
+        basal_rate = 0.9  # U/hr (using conservative value)
+        
+        # Calculate totals
+        total_basal = basal_rate * 24  # U/hr * 24 hours
+        
+        mask = (df.index >= last_24h_start) & (df.index <= last_24h_end)
+        total_bolus = df.loc[mask, 'bolus'].sum()
+        total_insulin = total_basal + total_bolus
+        current_basal_rate = basal_rate
+
+
+
+        # 5. Prepare historical data for prediction
+        window_size = model_instance.DIA // 5  # Convert DIA minutes to number of 5-min intervals
+        historical_window = df[df.index <= utc_pred_time].tail(window_size).copy()
+        latest_time = historical_window.index[-1]
+
+        # Create prediction row with historical data
+        prediction_data = {
+            'CGM': [historical_window['CGM'].iloc[-1]],
+            'basal': [historical_window['basal'].iloc[-1]],
+            'bolus': [historical_window['bolus'].iloc[-1]],
+            'carbs': [historical_window['carbs'].iloc[-1]]
+        }
+
+        # Add historical CGM values
+        for i in range(1, len(historical_window)):
+            prediction_data[f'CGM_minus_{i*5}'] = [historical_window['CGM'].iloc[-(i+1)]]
+
+        # Add historical bolus and carb values
+        for i in range(1, len(historical_window)):
+            prediction_data[f'bolus_minus_{i*5}'] = [historical_window['bolus'].iloc[-(i+1)]]
+            prediction_data[f'carbs_minus_{i*5}'] = [historical_window['carbs'].iloc[-(i+1)]]
+
+        # Get future events (next hour)
+        future_df = df[df.index > utc_pred_time].copy()
+        
+        # Add what-if projections for next hour
+        future_times = pd.date_range(
+            start=latest_time + pd.Timedelta(minutes=5),
+            periods=12,
+            freq='5min'
+        )
+
+        # Add projections including any known future events
+        for i, future_time in enumerate(future_times, 1):
+            time_diff = i * 5
+            
+            # If we have data for this future time, use it
+            if future_time in future_df.index:
+                prediction_data[f'basal_what_if_{time_diff}'] = [future_df.loc[future_time, 'basal']]
+                prediction_data[f'bolus_what_if_{time_diff}'] = [future_df.loc[future_time, 'bolus']]
+                prediction_data[f'carbs_what_if_{time_diff}'] = [future_df.loc[future_time, 'carbs']]
+            else:
+                # Otherwise use current basal rate and zero for bolus/carbs
+                prediction_data[f'basal_what_if_{time_diff}'] = [df['basal'].iloc[-1]]
+                prediction_data[f'bolus_what_if_{time_diff}'] = [0]
+                prediction_data[f'carbs_what_if_{time_diff}'] = [0]
+
+        # Create prediction DataFrame
+        prediction_row = pd.DataFrame(prediction_data, index=[latest_time])
+
+        # Debug future events
+        click.echo("\nFuture events in prediction window:")
+        future_events = future_df[(future_df['carbs'] > 0) | (future_df['bolus'] > 0)]
+        for idx, row in future_events.iterrows():
+            local_time = idx.astimezone(local_tz)
+            if row['carbs'] > 0:
+                click.echo(f"Carbs at {local_time.strftime('%H:%M')}: {row['carbs']}g")
+            if row['bolus'] > 0:
+                click.echo(f"Bolus at {local_time.strftime('%H:%M')}: {row['bolus']}U")
+
+        # 6. Make prediction using fixed ISF/CR values
+        isf = 180  # Fixed ISF for testing
+        cr = 50    # Fixed CR for testing
+
+        output_dict = model_instance.get_prediction_output(
+            df_row=prediction_row.iloc[0],
+            input_dict=model_instance.get_input_dict(
+                insulin_sensitivity=isf,
+                carb_ratio=cr,
+                basal=current_basal_rate
+            ),
+            time_to_calculate=latest_time
+        )
+
+        if not output_dict or "predicted_glucose_values" not in output_dict:
+            click.echo("\nError: Failed to generate predictions")
+            return
+
+        predictions = output_dict["predicted_glucose_values"][:12]
+
+        # 7. Output results
+        click.echo("\nDaily Statistics (Last 24 Hours):")
+        click.echo(f"Total Daily Insulin: {total_insulin:.2f} U")
+        click.echo(f"Total Basal: {total_basal:.2f} U")
+        click.echo(f"Total Bolus: {total_bolus:.2f} U")
+        click.echo(f"Current Basal Rate: {current_basal_rate:.3f} U/hr")
+
+        click.echo(f"\nPrediction Parameters:")
+        click.echo(f"ISF: {isf:.1f} mg/dL/U")
+        click.echo(f"CR: {cr:.1f} g/U")
+
+        click.echo("\nHistorical Data Summary:")
+        click.echo(f"Latest CGM: {prediction_row['CGM'].iloc[0]}")
+        click.echo(f"Historical CGM values: {len([col for col in prediction_row.columns if 'CGM_minus_' in col])}")
+        click.echo(f"Historical bolus values: {len([col for col in prediction_row.columns if 'bolus_minus_' in col])}")
+        click.echo(f"Future intervals: {len([col for col in prediction_row.columns if 'what_if' in col])}")
+
+        click.echo("\nPredictions for the next hour:")
+        for i, pred in enumerate(predictions):
+            pred_time = utc_pred_time + timedelta(minutes=5*i)
+            local_time = pred_time.astimezone(local_tz)
+            click.echo(f"{local_time.strftime('%Y-%m-%d %H:%M')}: {pred:.1f} mg/dL")
+
+        return predictions
+
+    except Exception as e:
+        click.echo(f"\nError during prediction: {str(e)}")
+        raise
+
+
 # Create the CLI group OUTSIDE of any function
 cli = click.Group(commands={
     'setup_directories': setup_directories,
@@ -940,7 +1134,8 @@ cli = click.Group(commands={
     'generate_evaluation_pdf': generate_evaluation_pdf,
     'generate_comparison_pdf': generate_comparison_pdf,
     'set_unit': set_unit,
-    'predict_loop': predict_loop
+    'predict_loop': predict_loop,
+    'predict_loop2': predict_loop2
 })
 
 if __name__ == "__main__":
