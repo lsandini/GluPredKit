@@ -376,10 +376,21 @@ class Parser(BaseParser):
         percents = []
         
         for entry in data:
-            if event_type:
-                # Handle treatments (insulin, carbs, etc.)
-                if isinstance(event_type, list):
-                    if any(et in entry.eventType for et in event_type):
+            try:
+                if event_type:
+                    # Handle treatments (insulin, carbs, etc.)
+                    if isinstance(event_type, list):
+                        if any(et in entry.eventType for et in event_type):
+                            dates.append(pd.to_datetime(getattr(entry, date_column), utc=True))
+                            if isinstance(value_column, list):
+                                value = getattr(entry, value_column[0], None)
+                                if value is None or pd.isna(value):
+                                    value = getattr(entry, value_column[1], 0)
+                            else:
+                                value = getattr(entry, value_column, 0)
+                            values.append(value if not pd.isna(value) else 0)
+                            percents.append(getattr(entry, 'percent', 0))
+                    elif event_type in entry.eventType:
                         dates.append(pd.to_datetime(getattr(entry, date_column), utc=True))
                         if isinstance(value_column, list):
                             value = getattr(entry, value_column[0], None)
@@ -389,28 +400,30 @@ class Parser(BaseParser):
                             value = getattr(entry, value_column, 0)
                         values.append(value if not pd.isna(value) else 0)
                         percents.append(getattr(entry, 'percent', 0))
-                elif event_type in entry.eventType:
-                    dates.append(pd.to_datetime(getattr(entry, date_column), utc=True))
-                    if isinstance(value_column, list):
-                        value = getattr(entry, value_column[0], None)
-                        if value is None or pd.isna(value):
-                            value = getattr(entry, value_column[1], 0)
-                    else:
-                        value = getattr(entry, value_column, 0)
-                    values.append(value if not pd.isna(value) else 0)
-                    percents.append(getattr(entry, 'percent', 0))
-            else:
-                # Handle entries (glucose values)
-                if date_column == 'date':
-                    # Convert Unix timestamp in milliseconds to datetime
-                    date_value = pd.to_datetime(getattr(entry, 'dateString'), utc=True)
                 else:
-                    date_value = pd.to_datetime(getattr(entry, date_column), utc=True)
-                dates.append(date_value)
-                
-                value = getattr(entry, value_column, 0)
-                values.append(value if not pd.isna(value) else 0)
-                percents.append(0)
+                    # Handle entries (glucose values)
+                    # Try different date attributes
+                    if hasattr(entry, 'dateString'):
+                        date_value = pd.to_datetime(entry.dateString, utc=True)
+                    elif hasattr(entry, 'date'):
+                        # Handle both string dates and millisecond timestamps
+                        try:
+                            date_value = pd.to_datetime(entry.date, utc=True)
+                        except (TypeError, ValueError):
+                            # If it's a millisecond timestamp
+                            date_value = pd.to_datetime(entry.date, unit='ms', utc=True)
+                    else:
+                        raise AttributeError(f"No valid date field found in entry")
+
+                    dates.append(date_value)
+                    value = getattr(entry, value_column, 0)
+                    values.append(value if not pd.isna(value) else 0)
+                    percents.append(0)
+            
+            except Exception as e:
+                print(f"Error processing entry: {entry}")
+                print(f"Error details: {str(e)}")
+                raise
         
         df = pd.DataFrame({
             'date': dates,
