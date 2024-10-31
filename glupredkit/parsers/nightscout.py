@@ -533,10 +533,28 @@ class Parser(BaseParser):
         with open(filename, 'w') as f:
             json.dump(profiles, f, indent=2)
 
+    # def entry_to_dict(self, entry):
+    #     """
+    #     Convert entry object to dictionary.
+    #     """
+    #     if hasattr(entry, '__dict__'):
+    #         return entry.__dict__
+    #     return dict(entry)
+
+
     def entry_to_dict(self, entry):
         """
-        Convert entry object to dictionary.
+        Convert entry object to dictionary with only essential fields.
+        For both entries and treatments.
         """
-        if hasattr(entry, '__dict__'):
-            return entry.__dict__
+        if hasattr(entry, '_json'):
+            # If it's an API response object (SGV or Treatment), return the original JSON
+            return entry._json
+        elif hasattr(entry, '__dict__'):
+            # For test data, get all attributes except internal ones
+            data = {}
+            for key, value in entry.__dict__.items():
+                if not key.startswith('_'):  # Skip internal attributes
+                    data[key] = value
+            return data
         return dict(entry)

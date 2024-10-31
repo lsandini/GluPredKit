@@ -16,7 +16,7 @@ error-grids
 # tensorflow==2.14.0
 # keras-tcn
 # torch
-# opsb-pyloopkit==0.1.0 # This is the original pyloopkit with linear meal model
+opsb-pyloopkit==0.1.0 # This is the original pyloopkit with linear meal model
 # py_replay_bg
 # Testing dependencies
 # pytest
