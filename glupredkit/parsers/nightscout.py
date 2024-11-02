@@ -8,6 +8,48 @@ import json
 import os
 import urllib.parse
 
+# Monkey patch the Treatment class, so no need to modify models.py in nightscout package
+from nightscout.models import Treatment
+
+original_init = Treatment.__init__
+
+def new_init(self, **kwargs):
+    # Set up param_defaults with all possible attributes
+    self.param_defaults = {
+        'temp': None,
+        'enteredBy': None,
+        'eventType': None,
+        'glucose': None,
+        'glucoseType': None,
+        'units': None,
+        'device': None,
+        'created_at': None,
+        'timestamp': None,
+        'absolute': None,
+        'percent': None,
+        'percentage': None,
+        'rate': None,
+        'duration': None,
+        'carbs': None,
+        'insulin': None,
+        'unabsorbed': None,
+        'suspended': None,
+        'type': None,
+        'programmed': None,
+        'foodType': None,
+        'absorptionTime': None,
+        'profile': None
+    }
+    # Set all default attributes
+    for (param, default) in self.param_defaults.items():
+        setattr(self, param, kwargs.get(param, default))
+    
+    # Call original init
+    original_init(self, **kwargs)
+
+# Replace the __init__ method
+Treatment.__init__ = new_init
+
 class Parser(BaseParser):
     def __init__(self):
         super().__init__()
@@ -165,26 +207,27 @@ class Parser(BaseParser):
             raise RuntimeError(f"Error fetching data: {str(e)}")
             
 
-
     def create_profile_switches_df(self, treatments):
-            """Create DataFrame for profile switches."""
-            switches = []
-            for treatment in treatments:
-                if hasattr(treatment, 'eventType') and treatment.eventType == 'Profile Switch':
-                    switch = {
-                        'date': pd.to_datetime(treatment.created_at, utc=True),
-                        'profile': treatment.profile,
-                        'duration': getattr(treatment, 'duration', None)  # Optional duration
-                    }
+        """Create DataFrame for profile switches."""
+        switches = []
+        for treatment in treatments:
+            if hasattr(treatment, 'eventType') and treatment.eventType == 'Profile Switch':
+                switch = {
+                    'date': pd.to_datetime(treatment.created_at, utc=True),
+                    'profile': getattr(treatment, 'profile', None),  # Safely get profile
+                    'duration': getattr(treatment, 'duration', None)  # Optional duration
+                }
+                # Only add if we actually have a profile
+                if switch['profile'] is not None:
                     switches.append(switch)
-            
-            if not switches:
-                return pd.DataFrame(columns=['profile', 'duration'])
-            
-            df = pd.DataFrame(switches)
-            df.set_index('date', inplace=True)
-            df.sort_index(inplace=True)
-            return df
+        
+        if not switches:
+            return pd.DataFrame(columns=['profile', 'duration'])
+        
+        df = pd.DataFrame(switches)
+        df.set_index('date', inplace=True)
+        df.sort_index(inplace=True)
+        return df
 
     def apply_profile_switches(self, df_basal, profile_switches, profiles):
             """Apply profile switches to basal rates."""
