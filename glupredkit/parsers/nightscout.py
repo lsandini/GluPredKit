@@ -571,14 +571,6 @@ class Parser(BaseParser):
         with open(filename, 'w') as f:
             json.dump(profiles, f, indent=2)
 
-    # def entry_to_dict(self, entry):
-    #     """
-    #     Convert entry object to dictionary.
-    #     """
-    #     if hasattr(entry, '__dict__'):
-    #         return entry.__dict__
-    #     return dict(entry)
-
 
     def entry_to_dict(self, entry):
         """

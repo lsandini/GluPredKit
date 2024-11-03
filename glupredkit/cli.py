@@ -790,8 +790,6 @@ def predict_loop2(parser, username, password, model, prediction_time):
         total_insulin = total_basal + total_bolus
         current_basal_rate = basal_rate
 
-
-
         # 5. Prepare historical data for prediction
         window_size = model_instance.DIA // 5  # Convert DIA minutes to number of 5-min intervals
         historical_window = df[df.index <= utc_pred_time].tail(window_size).copy()
@@ -853,36 +851,36 @@ def predict_loop2(parser, username, password, model, prediction_time):
                 click.echo(f"Bolus at {local_time.strftime('%H:%M')}: {row['bolus']}U")
 
         # 6. Make prediction using fixed ISF/CR values
-            trained_isf = model_instance.insulin_sensitivity_factor[0] if model_instance.insulin_sensitivity_factor else None
-            trained_cr = model_instance.carb_ratio[0] if model_instance.carb_ratio else None
-            
-            click.echo("\nModel's trained optimal parameters:")
-            click.echo(f"Trained ISF: {trained_isf:.1f} mg/dL/U" if trained_isf is not None else "Trained ISF: Not found in model")
-            click.echo(f"Trained CR: {trained_cr:.1f} g/U" if trained_cr is not None else "Trained CR: Not found in model")
-            
-            # Currently using hardcoded values
-            isf = 36  # Fixed ISF for testing
-            cr = 10   # Fixed CR for testing
-            
-            click.echo("\nCurrently using hardcoded parameters:")
-            click.echo(f"Current ISF: {isf:.1f} mg/dL/U")
-            click.echo(f"Current CR: {cr:.1f} g/U")
+        trained_isf = model_instance.insulin_sensitivity_factor[0] if model_instance.insulin_sensitivity_factor else None
+        trained_cr = model_instance.carb_ratio[0] if model_instance.carb_ratio else None
+        
+        click.echo("\nModel's trained optimal parameters:")
+        click.echo(f"Trained ISF: {trained_isf:.1f} mg/dL/U" if trained_isf is not None else "Trained ISF: Not found in model")
+        click.echo(f"Trained CR: {trained_cr:.1f} g/U" if trained_cr is not None else "Trained CR: Not found in model")
+        
+        # Currently using hardcoded values
+        isf = 36  # Fixed ISF for testing
+        cr = 10   # Fixed CR for testing
+        
+        click.echo("\nCurrently using hardcoded parameters:")
+        click.echo(f"Current ISF: {isf:.1f} mg/dL/U")
+        click.echo(f"Current CR: {cr:.1f} g/U")
 
-            output_dict = model_instance.get_prediction_output(
-                df_row=prediction_row.iloc[0],
-                input_dict=model_instance.get_input_dict(
-                    insulin_sensitivity=isf,
-                    carb_ratio=cr,
-                    basal=current_basal_rate
-                ),
-                time_to_calculate=latest_time
-            )
+        output_dict = model_instance.get_prediction_output(
+            df_row=prediction_row.iloc[0],
+            input_dict=model_instance.get_input_dict(
+                insulin_sensitivity=trained_isf,
+                carb_ratio=trained_cr,
+                basal=current_basal_rate
+            ),
+            time_to_calculate=latest_time
+        )
 
-            if not output_dict or "predicted_glucose_values" not in output_dict:
-                click.echo("\nError: Failed to generate predictions")
-                return
+        if not output_dict or "predicted_glucose_values" not in output_dict:
+            click.echo("\nError: Failed to generate predictions")
+            return
 
-            predictions = output_dict["predicted_glucose_values"][:12]
+        predictions = output_dict["predicted_glucose_values"][:12]
 
         # 7. Output results
         click.echo("\nDaily Statistics (Last 24 Hours):")
