@@ -14,7 +14,7 @@ from nightscout.models import Treatment
 original_init = Treatment.__init__
 
 def new_init(self, **kwargs):
-    # Set up param_defaults with all possible attributes
+    # Set up param_defaults with all possible attributes, including new ones for Loop/Trio
     self.param_defaults = {
         'temp': None,
         'enteredBy': None,
@@ -38,7 +38,10 @@ def new_init(self, **kwargs):
         'programmed': None,
         'foodType': None,
         'absorptionTime': None,
-        'profile': None
+        'profile': None,
+        'insulinNeedsScaleFactor': None,  # Added for Loop/Trio
+        'reason': None,  # Added for Loop/Trio
+        'automatic': None  # Added for Loop/Trio
     }
     # Set all default attributes
     for (param, default) in self.param_defaults.items():
@@ -205,24 +208,45 @@ class Parser(BaseParser):
                                "password (API key) is correct.") from error
         except Exception as e:
             raise RuntimeError(f"Error fetching data: {str(e)}")
-            
 
     def create_profile_switches_df(self, treatments):
-        """Create DataFrame for profile switches."""
+        """Create DataFrame for profile switches and temporary overrides."""
         switches = []
         for treatment in treatments:
-            if hasattr(treatment, 'eventType') and treatment.eventType == 'Profile Switch':
-                switch = {
-                    'date': pd.to_datetime(treatment.created_at, utc=True),
-                    'profile': getattr(treatment, 'profile', None),  # Safely get profile
-                    'duration': getattr(treatment, 'duration', None)  # Optional duration
-                }
-                # Only add if we actually have a profile
+            if not hasattr(treatment, 'eventType'):
+                continue
+                
+            switch = {
+                'date': pd.to_datetime(treatment.created_at, utc=True),
+                'profile': None,
+                'scale_factor': 1.0,  # Default no scaling
+                'duration': None,
+                'source': None
+            }
+            
+            # Handle AndroidAPS Profile Switches
+            if treatment.eventType == 'Profile Switch':
+                switch.update({
+                    'profile': getattr(treatment, 'profile', None),
+                    'duration': getattr(treatment, 'duration', None),
+                    'source': 'AndroidAPS'
+                })
                 if switch['profile'] is not None:
+                    switches.append(switch)
+                
+            # Handle Loop/Trio Temporary Overrides
+            elif treatment.eventType == 'Temporary Override':
+                scale_factor = getattr(treatment, 'insulinNeedsScaleFactor', None)
+                if scale_factor is not None:
+                    switch.update({
+                        'scale_factor': float(scale_factor),
+                        'duration': getattr(treatment, 'duration', None),
+                        'source': 'Loop' if 'Loop' in getattr(treatment, 'enteredBy', '') else 'Trio'
+                    })
                     switches.append(switch)
         
         if not switches:
-            return pd.DataFrame(columns=['profile', 'duration'])
+            return pd.DataFrame(columns=['profile', 'scale_factor', 'duration', 'source'])
         
         df = pd.DataFrame(switches)
         df.set_index('date', inplace=True)
@@ -230,104 +254,75 @@ class Parser(BaseParser):
         return df
 
     def apply_profile_switches(self, df_basal, profile_switches, profiles):
-            """Apply profile switches to basal rates."""
-            if profile_switches.empty:
-                return df_basal
+        """Apply profile switches and temporary overrides to basal rates."""
+        if profile_switches.empty:
+            return df_basal
+        
+        store = profiles[0].get('store', {})
+        result_df = df_basal.copy()
+        
+        # Process each switch/override chronologically
+        for time, row in profile_switches.iterrows():
+            # Calculate end time
+            if pd.notnull(row['duration']):
+                end_time = time + pd.Timedelta(minutes=float(row['duration']))
+            else:
+                # If no duration, effective until next switch or end of data
+                later_switches = profile_switches.index[profile_switches.index > time]
+                end_time = later_switches[0] if len(later_switches) > 0 else df_basal.index[-1]
             
-            store = profiles[0].get('store', {})
-            result_df = df_basal.copy()
+            # Create mask for the time period
+            mask = (result_df.index >= time) & (result_df.index < end_time)
             
-            # Process each switch
-            for time, row in profile_switches.iterrows():
-                if row['profile'] not in store:
-                    continue
+            if row['source'] == 'AndroidAPS':
+                # Handle AndroidAPS Profile Switch
+                if row['profile'] and row['profile'] in store:
+                    new_profile = store[row['profile']]
+                    new_basal_rates = []
+                    for entry in new_profile.get('basal', []):
+                        seconds = entry.get('timeAsSeconds', 0)
+                        rate = entry.get('value', 0)
+                        new_basal_rates.append((seconds, rate))
+                    new_basal_rates.sort()
                     
-                # Get basal rates for the new profile
-                new_profile = store[row['profile']]
-                new_basal_rates = []
-                for entry in new_profile.get('basal', []):
-                    seconds = entry.get('timeAsSeconds', 0)
-                    rate = entry.get('value', 0)
-                    new_basal_rates.append((seconds, rate))
-                new_basal_rates.sort()
-                
-                # Calculate end time
-                if pd.notnull(row['duration']):
-                    end_time = time + pd.Timedelta(minutes=int(row['duration']))
-                else:
-                    # If no duration, effective until next switch or end of data
-                    later_switches = profile_switches.index[profile_switches.index > time]
-                    end_time = later_switches[0] if len(later_switches) > 0 else df_basal.index[-1]
-                
-                # Update basal rates for the time period
-                mask = (result_df.index >= time) & (result_df.index < end_time)
-                for idx in result_df[mask].index:
-                    seconds = (idx.hour * 3600 + idx.minute * 60 + idx.second)
-                    rate = self.get_basal_rate_for_time(new_basal_rates, seconds)
-                    result_df.loc[idx, 'basal'] = rate
-            
-            return result_df
+                    # Update each timestep in the period
+                    for idx in result_df[mask].index:
+                        seconds = (idx.hour * 3600 + idx.minute * 60 + idx.second)
+                        rate = self.get_basal_rate_for_time(new_basal_rates, seconds)
+                        result_df.loc[idx, 'basal'] = rate
+                        
+            elif row['source'] in ['Loop', 'Trio']:
+                # Handle Loop/Trio Temporary Override
+                result_df.loc[mask, 'basal'] *= row['scale_factor']
+        
+        return result_df
 
     def merge_basal_rates(self, df, df_profile_basal, df_temp_basal, df_temp_duration):
-            """
-            Merge profile basal rates with temporary basal overrides, handling both absolute and percentage temp basals.
-            """
-            # Fill any NaN in profile basal rates with 0
-            df_profile_basal['basal'] = df_profile_basal['basal'].fillna(0)
+        """Merge profile basal rates with temporary basal overrides."""
+        # Start with profile basal rates
+        df = df.merge(df_profile_basal, left_index=True, right_index=True, how='left')
+        df['basal'] = df['basal'].fillna(0)
+        
+        if not df_temp_basal.empty:
+            temp_basals = pd.concat([df_temp_basal, df_temp_duration], axis=1)
+            temp_basals.columns = ['basal', 'percent_x', 'duration', 'percent_y']
             
-            # Start with profile basal rates
-            df = df.merge(df_profile_basal, left_index=True, right_index=True, how='left')
-            df['basal'] = df['basal'].fillna(0)  # Fill any NaN after merge
-            
-            if not df_temp_basal.empty:
-                # For each temp basal entry
-                temp_basals = pd.concat([df_temp_basal, df_temp_duration], axis=1)
-                # Rename duplicate columns to avoid confusion
-                temp_basals.columns = ['basal', 'percent_x', 'duration', 'percent_y']
+            for time, row in temp_basals.iterrows():
+                end_time = time + pd.Timedelta(minutes=float(row['duration']))
+                mask = (df.index >= time) & (df.index < end_time)
                 
-                # Fill NaN in temp basals
-                temp_basals['basal'] = temp_basals['basal'].fillna(0)
-                temp_basals['percent_x'] = temp_basals['percent_x'].fillna(100)  # Default to 100% if not specified
+                basal_value = float(row['basal']) if pd.notnull(row['basal']) else 0
+                percent_value = float(row['percent_x']) if pd.notnull(row['percent_x']) else 100
                 
-                print("\nTemp basals after concat:")
-                print(temp_basals)
-                
-                for time, row in temp_basals.iterrows():
-                    print(f"\nProcessing temp basal at {time}:")
-                    print(f"Row data: {row.to_dict()}")
-                    
-                    # Calculate end time of temp basal
-                    end_time = time + pd.Timedelta(minutes=int(row['duration']))
-                    print(f"End time: {end_time}")
-                    
-                    # Get the mask for this time period
-                    mask = (df.index >= time) & (df.index < end_time)
-                    affected_rows = df[mask]
-                    print(f"Number of affected rows: {len(affected_rows)}")
-                    
-                    # Check if we have an absolute value or percent
-                    basal_value = float(row['basal']) if pd.notnull(row['basal']) else 0
-                    percent_value = float(row['percent_x']) if pd.notnull(row['percent_x']) else 100
-                    
-                    print(f"Basal value: {basal_value}")
-                    print(f"Percent value: {percent_value}")
-                    
-                    if basal_value > 0:  # Absolute temp basal
-                        print(f"Applying absolute basal: {basal_value}")
-                        df.loc[mask, 'basal'] = basal_value
-                    elif percent_value != 100:  # Percentage temp basal
-                        profile_rates = df.loc[mask, 'basal']
-                        print(f"Profile rates before adjustment: {profile_rates.head()}")
-                        new_rates = profile_rates * (percent_value / 100)
-                        print(f"New rates after percentage: {new_rates.head()}")
-                        df.loc[mask, 'basal'] = new_rates
-                    
-                    print("Sample of affected rows after update:")
-                    print(df[mask].head())
-            
-            # Fill any remaining NaN values
-            df['basal'] = df['basal'].fillna(0)
-            return df
+                if basal_value > 0:  # Absolute temp basal
+                    df.loc[mask, 'basal'] = basal_value
+                elif percent_value != 100:  # Percentage temp basal
+                    current_rates = df.loc[mask, 'basal']
+                    new_rates = current_rates * (percent_value / 100)
+                    df.loc[mask, 'basal'] = new_rates
+        
+        df['basal'] = df['basal'].fillna(0)
+        return df
 
     def get_basal_rates_from_profile(self, profiles):
             """
