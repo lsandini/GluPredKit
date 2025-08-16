@@ -59,20 +59,42 @@ class Parser(BaseParser):
         In the nightscout parser, the username is the nightscout URL, and the password is the API key.
         """
         try:
-            api = nightscout.Api(username, api_secret=password)
+            print(f"Initializing Nightscout API with URL: {username}")
+            
+            # For public Nightscout instances that don't require authentication,
+            # we'll use direct requests instead of the nightscout library
+            base_url = username.rstrip('/')
             api_start_date = start_date.strftime('%Y-%m-%dT%H:%M:%S.000Z')
             api_end_date = end_date.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+            print(f"Date range: {api_start_date} to {api_end_date}")
+            
+            # Initialize api object for compatibility, but we'll override some methods
+            api = nightscout.Api(username, api_secret=password if password else None)
 
+            # Helper function to make requests with optional authentication
+            def make_request(url, params=None):
+                # First try without authentication (for public instances)
+                response = requests.get(url, params=params)
+                if response.status_code == 401 and password:
+                    # If unauthorized, try with API secret
+                    headers = api.request_headers()
+                    response = requests.get(url, headers=headers, params=params)
+                return response
+            
             # Fetch profiles
             profile_query_params = {
                 'count': 0,
                 'find[created_at][$gte]': api_start_date,
                 'find[created_at][$lte]': api_end_date
             }
-            base_url = username.rstrip('/')
-            profile_url = f"{base_url}/api/v1/profile?{urllib.parse.urlencode(profile_query_params)}"
-            profiles_response = requests.get(profile_url, headers=api.request_headers())
-            profiles = profiles_response.json()
+            profile_url = f"{base_url}/api/v1/profile"
+            profiles_response = make_request(profile_url, profile_query_params)
+            
+            if profiles_response.status_code == 200:
+                profiles = profiles_response.json()
+            else:
+                print(f"Failed to fetch profiles: {profiles_response.status_code}")
+                profiles = []
 
             # Fetch treatments
             treatment_query_params = {
@@ -80,7 +102,29 @@ class Parser(BaseParser):
                 'find[created_at][$gte]': api_start_date,
                 'find[created_at][$lte]': api_end_date
             }
-            treatments = api.get_treatments(treatment_query_params)
+            treatment_url = f"{base_url}/api/v1/treatments.json"
+            treatments_response = make_request(treatment_url, treatment_query_params)
+            
+            if treatments_response.status_code == 200:
+                treatments_json = treatments_response.json()
+                # Convert JSON to Treatment objects
+                treatments = []
+                for item in treatments_json:
+                    try:
+                        # Create Treatment object from dictionary
+                        treatment = Treatment(**item)
+                        treatments.append(treatment)
+                    except Exception as e:
+                        # If the standard creation fails, try the new_from_json_dict method
+                        try:
+                            treatment = Treatment.new_from_json_dict(item)
+                            treatments.append(treatment)
+                        except:
+                            # Skip problematic treatments
+                            continue
+            else:
+                print(f"Failed to fetch treatments: {treatments_response.status_code}")
+                treatments = []
 
             # Fetch entries (CGM data)
             query_params = {
@@ -88,7 +132,28 @@ class Parser(BaseParser):
                 'find[dateString][$gte]': api_start_date,
                 'find[dateString][$lte]': api_end_date
             }
-            entries = api.get_sgvs(query_params)
+            entries_url = f"{base_url}/api/v1/entries.json"
+            entries_response = make_request(entries_url, query_params)
+            
+            if entries_response.status_code == 200:
+                entries_json = entries_response.json()
+                # Convert JSON to SGV objects
+                from nightscout.models import SGV
+                entries = []
+                for item in entries_json:
+                    try:
+                        entry = SGV.new_from_json_dict(item)
+                        entries.append(entry)
+                    except:
+                        # Try direct creation
+                        try:
+                            entry = SGV(**item)
+                            entries.append(entry)
+                        except:
+                            continue
+            else:
+                print(f"Failed to fetch entries: {entries_response.status_code}")
+                entries = []
 
             if save_raw_json:
                 self.save_json_profiles(profiles, 'profiles', api_start_date, api_end_date)
