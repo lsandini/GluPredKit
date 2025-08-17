@@ -1,0 +1,107 @@
+First, install tf-keras (Keras 2):
+pip install tf-keras
+
+Then, before running your code, set the environment variable:
+# Linux/Mac
+export TF_USE_LEGACY_KERAS=True
+
+==========================================
+
+python -m glupredkit.cli parse --parser nightscout --username https://lorenzo.oracle.cgmsim.com/ --password chaXXXXXXease! --start-date 11-10-2024 --end-date 18-10-2024
+
+python -m glupredkit.cli parse --parser nightscout --username https://nickxbs.cgmsim.com/ --password CiccioPasticcio1 --start-date 14-08-2025 --end-date 15-08-2025
+
+SYNTAX:
+=======
+
+https://lorenzo.oracle.cgmsim.com/api/v1/entries/sgv.json?count=0&find%5BdateString%5D%5B%24gte%5D=2024-10-11T00%3A00%3A00.000Z&find%5BdateString%5D%5B%24lte%5D=2024-10-18T00%3A00%3A00.000Z
+
+https://lorenzo.oracle.cgmsim.com/api/v1/treatments?count=0&find%5Bcreated_at%5D%5B%24gte%5D=2024-10-16T00%3A00%3A00.000Z&find%5Bcreated_at%5D%5B%24lte%5D=2024-10-18T00%3A00%3A00.000Z
+
+NEW TEST RANDOM FOREST
+=======================
+
+python -m glupredkit.cli parse --parser nightscout \
+  --username https://nickxbs.cgmsim.com/ \
+  --password CiccioPasticcio1 \
+  --start-date 01-08-2025 --end-date 15-08-2025
+
+python -m glupredkit.cli generate_config \
+  --file-name improved_config \
+  --data nightscout_01-08-2025_to_15-08-2025.csv \
+  --prediction-horizon 60 \
+  --num-lagged-features 12 \
+  --num-features CGM,basal,bolus,carbs \
+  --cat-features hour
+
+python -m glupredkit.cli train_model random_forest improved_config
+python -m glupredkit.cli evaluate_model random_forest__improved_config__60.pkl
+python -m glupredkit.cli generate_evaluation_pdf --results-file random_forest__improved_config__60.csv
+
+NEW EXTENDED TEST RANDOM FOREST
+===============================
+
+python -m glupredkit.cli parse --parser nightscout \
+  --username https://nickxbs.cgmsim.com/ \
+  --password CiccioPasticcio1 \
+  --start-date 16-07-2025 --end-date 15-08-2025
+
+python -m glupredkit.cli generate_config \
+  --file-name extended_model_config \
+  --data nightscout_16-07-2025_to_15-08-2025.csv \
+  --prediction-horizon 60 \
+  --num-lagged-features 36 \
+  --num-features CGM,basal,bolus,carbs \
+  --cat-features hour
+
+python -m glupredkit.cli train_model random_forest extended_model_config
+python -m glupredkit.cli evaluate_model random_forest__extended_model_config__60.pkl
+python -m glupredkit.cli generate_evaluation_pdf --results-file random_forest__extended_model_config__60.csv
+
+
+original:
+=========
+python -m glupredkit.cli generate_config \
+  --file-name my_nightscout_config \
+  --data nightscout_13-08-2025_to_15-08-2025.csv \
+  --prediction-horizon 60 \
+  --num-lagged-features 12 \
+  --num-features CGM,insulin,carbs \
+  --cat-features hour
+
+python -m glupredkit.cli train_model random_forest my_nightscout_config
+python -m glupredkit.cli evaluate_model random_forest__my_nightscout_config__60.pkl
+python -m glupredkit.cli generate_evaluation_pdf --results-file random_forest__my_nightscout_config__60.csv
+
+
+
+
+
+
+
+
+
+
+
+python -m glupredkit.cli parse --parser nightscout --username https://lorenzo.oracle.cgmsim.com/ --password chaXXXXXXXase! --start-date 16-10-2024 --end-date 18-10-2024
+python -m glupredkit.cli generate_config --file-name my_config_5 --data nightscout_11-10-2024_to_18-10-2024.csv --prediction-horizon 60 --num-lagged-features 12 --num-features CGM,insulin,carbs,basal,bolus
+python -m glupredkit.cli train_model lstm my_config_5 --epochs 5
+python -m glupredkit.cli evaluate_model lstm__my_config_5__60.pkl
+python -m glupredkit.cli generate_evaluation_pdf --results-file lstm__my_config_5__60.csv
+
+python -m glupredkit.cli generate_config --file-name my_config_3 --data nightscout_11-10-2024_to_18-10-2024.csv --prediction-horizon 60 --num-lagged-features 12 --num-features CGM,insulin,carbs,basal,bolus
+python -m glupredkit.cli train_model loop my_config_2 --epochs 5
+python -m glupredkit.cli evaluate_model loop__my_config_2__60.pkl
+python -m glupredkit.cli generate_evaluation_pdf --results-file loop__my_config_2__60.csv
+
+python -m glupredkit.cli generate_config --file-name my_config_4 --data test.csv --prediction-horizon 60 --num-lagged-features 12 --num-features CGM,insulin,carbs,basal,bolus
+python -m glupredkit.cli train_model loop my_config_4 --epochs 2
+python -m glupredkit.cli evaluate_model loop__my_config_4__60.pkl
+python -m glupredkit.cli generate_evaluation_pdf --results-file loop__my_config_4__60.csv
+
+
+python -m glupredkit.cli generate_evaluation_pdf --results-file lstm__my_config_2__60.csv
+
+python -m glupredkit.cli draw_plots --results-files lstm__my_config_2__60.csv --plots scatter_plot --prediction-horizons 30,60
+
+glupredkit draw_plots --results-files ridge__my_config__180.csv,lstm__my_config__180.csv --plots scatter_plot --start-date 25-10-2023/14:30 --end-date 30-10-2023/16:45 --prediction-horizons 30,60
