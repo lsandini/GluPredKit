@@ -1,11 +1,12 @@
 """
 Loop v2 model adapted to work on Linux using pyloopkit instead of loop_to_python_api.
 This provides the same functionality as loop_v2.py but works cross-platform.
+Fixed version with correct pyloopkit input/output format.
 """
 from .base_model import BaseModel
 from glupredkit.helpers.scikit_learn import process_data
 from glupredkit.metrics.rmse import Metric
-from pyloopkit import loop_data_manager
+from pyloopkit.loop_data_manager import update
 from pyloopkit.dose import DoseType
 
 import datetime
@@ -21,8 +22,9 @@ class Model(BaseModel):
         self.basal_rates = []
         self.insulin_sensitivities = []
         self.carb_ratios = []
+        self.DIA = 360  # Duration of insulin action in minutes
 
-    def _fit_model(self, x_train, y_train, n_cross_val_samples=50, *args):  # Reduced samples for testing
+    def _fit_model(self, x_train, y_train, n_cross_val_samples=200, *args):
         required_columns = ['CGM', 'carbs', 'basal', 'bolus']
         missing_columns = [col for col in required_columns if col not in x_train.columns]
         if missing_columns:
@@ -62,9 +64,7 @@ class Model(BaseModel):
             isf = 1800 / daily_avg_insulin  # ISF 1800 rule
             cr = 500 / daily_avg_insulin  # CR 500 rule
 
-            # Reduced factors for faster testing - change back to full range for production
-            # mult_factors = [0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4]
-            mult_factors = [0.8, 1.0, 1.2]  # Simplified for testing
+            mult_factors = [0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4]
 
             best_rmse = np.inf
             best_basal = basal
@@ -73,8 +73,7 @@ class Model(BaseModel):
             
             for i in mult_factors:
                 for j in mult_factors:
-                    # for basal_rate_factor in [0.3, 0.4, 0.5, 0.6]:  # Full range
-                    for basal_rate_factor in [0.4, 0.5]:  # Reduced for testing
+                    for basal_rate_factor in [0.3, 0.4, 0.5, 0.6]:
                         current_basal = daily_avg_insulin * basal_rate_factor / 24
                         y_pred = self._predict_model(subset_df_x, basal=current_basal, isf=isf*i, cr=cr*j)
 
@@ -110,65 +109,87 @@ class Model(BaseModel):
         for subject_idx, subject_id in enumerate(self.subject_ids):
             df_subset = x_test[x_test['id'] == subject_id]
 
+            # Use provided parameters or defaults
+            if basal is None:
+                basal = self.basal_rates[subject_idx] if self.basal_rates else 1.0
+            if isf is None:
+                isf = self.insulin_sensitivities[subject_idx] if self.insulin_sensitivities else 40
+            if cr is None:
+                cr = self.carb_ratios[subject_idx] if self.carb_ratios else 10
+
+            # Create base input dict
+            input_dict = self.get_input_dict(isf, cr, basal)
+
             for _, row in df_subset.iterrows():
-                # Get predictions using pyloopkit
-                predictions = self.get_predictions_from_pyloopkit(row, subject_idx, basal=basal, isf=isf, cr=cr)
-                predictions = [1 if val < 1 else 600 if val > 600 else val for val in predictions]
+                # Get predictions using pyloopkit with proper format
+                output_dict = self.get_prediction_output(row, input_dict)
                 
-                # Take only the predictions we need (skipping first as it's the reference value)
-                y_pred += [predictions[1:n_predictions + 1]]
+                if output_dict and "predicted_glucose_values" in output_dict:
+                    predictions = output_dict["predicted_glucose_values"]
+                    # Clip to physiological range
+                    predictions = [max(1, min(600, val)) for val in predictions]
+                    # Skip first value (reference) and take only what we need
+                    if len(predictions) > n_predictions:
+                        y_pred += [predictions[1:n_predictions + 1]]
+                    else:
+                        # Pad with last value if needed
+                        result = predictions[1:] if len(predictions) > 1 else [row['CGM']]
+                        while len(result) < n_predictions:
+                            result.append(result[-1] if result else row['CGM'])
+                        y_pred += [result[:n_predictions]]
+                else:
+                    # Fallback to constant prediction
+                    y_pred += [[row['CGM']] * n_predictions]
 
         return y_pred
 
-    def get_predictions_from_pyloopkit(self, data, id_index, basal=None, isf=None, cr=None):
-        """
-        Generate predictions using pyloopkit instead of the Swift library.
-        This makes the model work on Linux/Windows/Mac.
-        """
-        try:
-            # Prepare input data similar to the original loop.py model
-            input_dict = self.prepare_loop_input(data, id_index, basal, isf, cr)
-            
-            # Use pyloopkit to get predictions
-            output = loop_data_manager.update(input_dict)
-            
-            # Check if output is valid
-            if output is None:
-                # Fallback: return constant prediction
-                return [data['CGM']] * (self.prediction_horizon // 5 + 1)
-            
-            # Extract predictions - try different possible keys
-            predictions = None
-            if isinstance(output, dict):
-                if "predicted_glucose_values" in output:
-                    predictions = output["predicted_glucose_values"]
-                elif "predicted_glucoses" in output:
-                    predictions = output["predicted_glucoses"]
-                elif "glucose_effect" in output:
-                    # Use glucose effect to estimate predictions
-                    current_glucose = data['CGM']
-                    glucose_effects = output["glucose_effect"]
-                    predictions = [current_glucose]
-                    for effect in glucose_effects[:self.prediction_horizon // 5]:
-                        predictions.append(predictions[-1] + effect)
-            
-            if predictions and len(predictions) > 0:
-                # Ensure we have enough predictions
-                while len(predictions) < (self.prediction_horizon // 5 + 1):
-                    predictions.append(predictions[-1])
-                return predictions
-            else:
-                # Fallback: return constant prediction
-                return [data['CGM']] * (self.prediction_horizon // 5 + 1)
-        except Exception as e:
-            # print(f"Error in get_predictions_from_pyloopkit: {e}")
-            # Fallback: return constant prediction
-            return [data['CGM']] * (self.prediction_horizon // 5 + 1)
+    def get_input_dict(self, insulin_sensitivity, carb_ratio, basal):
+        """Create the base input dictionary for pyloopkit, matching loop.py format."""
+        return {
+            'carb_value_units': 'g',
+            'settings_dictionary': {
+                'model': [self.DIA, 75],  # DIA and peak time
+                'momentum_data_interval': 15.0,
+                'suspend_threshold': None,
+                'dynamic_carb_absorption_enabled': True,
+                'retrospective_correction_integration_interval': 30,
+                'recency_interval': 15,
+                'retrospective_correction_grouping_interval': 30,
+                'rate_rounder': 0.05,
+                'insulin_delay': 10,
+                'carb_delay': 0,
+                'default_absorption_times': [120.0, 180.0, 240.0],
+                'max_basal_rate': basal * 4,  # Allow up to 4x basal
+                'max_bolus': 12.0,
+                'retrospective_correction_enabled': True
+            },
+            'sensitivity_ratio_start_times': [datetime.time(0, 0)],
+            'sensitivity_ratio_end_times': [datetime.time(0, 0)],
+            'sensitivity_ratio_values': [insulin_sensitivity],
+            'sensitivity_ratio_value_units': 'mg/dL/U',
+            'carb_ratio_start_times': [datetime.time(0, 0)],
+            'carb_ratio_values': [carb_ratio],
+            'carb_ratio_value_units': 'g/U',
+            'basal_rate_start_times': [datetime.time(0, 0)],
+            'basal_rate_minutes': [1440],
+            'basal_rate_values': [basal],
+            'basal_rate_value_units': 'U/hour',
+            'target_range_start_times': [datetime.time(0, 0)],
+            'target_range_end_times': [datetime.time(0, 0)],
+            'target_range_minimum_values': [100],
+            'target_range_maximum_values': [110],
+            'target_range_value_units': 'mg/dL'
+        }
 
-    def prepare_loop_input(self, data, id_index, basal=None, isf=None, cr=None):
-        """
-        Prepare input dictionary for pyloopkit, similar to loop.py model.
-        """
+    def get_prediction_output(self, df_row, input_dict):
+        """Get prediction output from pyloopkit, matching loop.py implementation."""
+        time_to_calculate = df_row.name
+        if isinstance(time_to_calculate, np.int64):
+            time_to_calculate = datetime.datetime.now()
+
+        input_dict["time_to_calculate_at"] = time_to_calculate
+
+        # Helper function to extract dates and values from dataframe row
         def get_dates_and_values(column, data):
             relevant_columns = [val for val in data.index if val.startswith(column)]
             dates = []
@@ -178,7 +199,7 @@ class Model(BaseModel):
             if isinstance(date, np.int64):
                 date = datetime.datetime.now()
 
-            for col in [col for col in relevant_columns if "diff" not in col]:
+            for col in relevant_columns:
                 if col == column:
                     values.append(data[col])
                     dates.append(date)
@@ -192,97 +213,64 @@ class Model(BaseModel):
                     dates.append(new_date)
 
             if dates and values:
-                # Sorting
+                # Sort by dates
                 combined = list(zip(dates, values))
                 combined.sort(key=lambda x: x[0])
                 dates, values = zip(*combined)
 
             return dates, values
 
-        # Get historical data
-        bolus_dates, bolus_values = get_dates_and_values('bolus', data)
-        basal_dates, basal_values = get_dates_and_values('basal', data)
-        carb_dates, carb_values = get_dates_and_values('carbs', data)
-        bg_dates, bg_values = get_dates_and_values('CGM', data)
+        # Get glucose data
+        glucose_dates, glucose_values = get_dates_and_values("CGM", df_row)
+        input_dict["glucose_dates"] = glucose_dates
+        input_dict["glucose_values"] = glucose_values
 
-        # Build dose entries
-        dose_entries = []
+        # Get insulin data
+        bolus_dates, bolus_values = get_dates_and_values("bolus", df_row)
+        basal_dates, basal_values = get_dates_and_values("basal", df_row)
+        
+        dose_types = []
+        dose_start_times = []
+        dose_end_times = []
+        dose_values = []
+        dose_delivered_units = []
+
+        # Add bolus doses
         for date, value in zip(bolus_dates, bolus_values):
             if value > 0:
-                dose_entries.append({
-                    "type": DoseType.bolus,
-                    "start_time": date,
-                    "end_time": date,
-                    "value": value,
-                    "unit": "U"
-                })
+                dose_types.append(DoseType.bolus)
+                dose_start_times.append(date)
+                dose_end_times.append(date)
+                dose_values.append(value)
+                dose_delivered_units.append(None)
 
+        # Add basal doses
         for date, value in zip(basal_dates, basal_values):
             if value > 0:
-                dose_entries.append({
-                    "type": DoseType.basal,
-                    "start_time": date,
-                    "end_time": date + datetime.timedelta(minutes=5),
-                    "value": value / 12,  # Converting from U/hr to delivered units in 5 minutes
-                    "unit": "U/hr",
-                    "scheduled_basal_rate": basal if basal else value
-                })
+                dose_types.append(DoseType.tempbasal)
+                dose_start_times.append(date)
+                dose_end_times.append(date + pd.Timedelta(minutes=5))
+                dose_values.append(value)  # Already in U/hr
+                dose_delivered_units.append(None)
 
-        # Build carb entries
-        carb_entries = []
-        for date, value in zip(carb_dates, carb_values):
-            if value > 0:
-                carb_entries.append({
-                    "start_time": date,
-                    "carb_value": value,
-                    "absorption_time": 180  # Default 3 hours
-                })
+        input_dict["dose_types"] = dose_types
+        input_dict["dose_start_times"] = dose_start_times
+        input_dict["dose_end_times"] = dose_end_times
+        input_dict["dose_values"] = dose_values
+        input_dict["dose_delivered_units"] = dose_delivered_units
 
-        # Build glucose entries
-        glucose_entries = []
-        for date, value in zip(bg_dates, bg_values):
-            if value > 0:
-                glucose_entries.append({
-                    "date": date,
-                    "value": value
-                })
+        # Get carb data
+        carb_data = df_row[df_row.index.str.startswith('carbs') & (df_row != 0)]
+        carb_dates, carb_values = get_dates_and_values("carbs", carb_data)
+        input_dict["carb_dates"] = carb_dates
+        input_dict["carb_values"] = carb_values
+        input_dict["carb_absorption_times"] = [180 for _ in carb_values]
 
-        # Use provided parameters or defaults
-        if basal is None:
-            basal = self.basal_rates[id_index] if self.basal_rates else 1.0
-        if isf is None:
-            isf = self.insulin_sensitivities[id_index] if self.insulin_sensitivities else 40
-        if cr is None:
-            cr = self.carb_ratios[id_index] if self.carb_ratios else 10
-
-        # Build the input dictionary for pyloopkit
-        current_time = bg_dates[-1] if bg_dates else datetime.datetime.now()
-        
-        input_dict = {
-            "dose_types": [DoseType.basal, DoseType.bolus],
-            "dose_entries": dose_entries,
-            "carb_entries": carb_entries,
-            "glucose_entries": glucose_entries,
-            "basal_rate_schedule": [(0, basal)],  # Single basal rate for simplicity
-            "sensitivity_schedule": [(0, isf)],
-            "carb_ratio_schedule": [(0, cr)],
-            "target_range_schedule": [(0, 100, 110)],  # Target range 100-110 mg/dL
-            "correction_range_schedule": [(0, 100, 110)],
-            "suspend_threshold": 70,
-            "max_basal_rate": basal * 4,
-            "max_bolus": 10,
-            "retrospective_correction_enabled": True,
-            "insulin_delay": 10,
-            "now_date": current_time,
-            "insulin_model": "humalog",
-            "momentum_data_interval": 15,
-            "default_absorption_times": [120, 150, 180, 240, 300],
-            "max_history_age": 60 * 60 * 24,  # 24 hours
-            "carb_delay": 10,
-            "retrospective_correction_grouping_interval": 30
-        }
-
-        return input_dict
+        try:
+            return update(input_dict)
+        except Exception as e:
+            print(f"Error in pyloopkit update: {e}")
+            return None
 
     def best_params(self):
         best_params = [{
